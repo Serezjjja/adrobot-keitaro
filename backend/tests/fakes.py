@@ -62,6 +62,8 @@ class FakeKeitaro:
         self.fail_stream_position: int | None = None
         self.timeout_after_put = False
         self.timeout_after_campaign = False
+        self.timeout_during_enable = False
+        self.delete_after_put = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         assert request.headers.get("Api-Key") == "fake-key"
@@ -88,12 +90,16 @@ class FakeKeitaro:
             return httpx.Response(200, json=stream)
         if method == "POST" and path.endswith("/enable"):
             campaign = self.campaigns[int(path.split("/")[1])]
+            if self.timeout_during_enable:
+                raise httpx.ReadTimeout("Activation not confirmed", request=request)
             campaign["state"] = "active"
             return httpx.Response(200, json=campaign)
         if method == "PUT" and path.startswith("streams/"):
             assert set(payload) == {"offers"}
             stream = self.streams[int(path.split("/")[1])]
             stream["offers"] = payload["offers"]
+            if self.delete_after_put:
+                stream["state"] = "deleted"
             if self.timeout_after_put:
                 raise httpx.ReadTimeout("Response lost", request=request)
             return httpx.Response(200, json=stream)

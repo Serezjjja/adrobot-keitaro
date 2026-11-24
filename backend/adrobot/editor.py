@@ -61,7 +61,7 @@ def _archive(offer: Offer) -> Offer:
 
 def _stream_view(stream: StreamDraft) -> StreamView:
     dirty = stream.draft is not None
-    offers = _load(stream.draft if dirty else stream.published)
+    offers = _load(stream.draft if dirty else stream.published) if stream.editable else []
     return StreamView(
         id=stream.id,
         name=stream.name,
@@ -86,12 +86,21 @@ def _campaign_rows(db: Session, campaign_id: int) -> list[StreamDraft]:
 
 
 def list_streams(db: Session, campaign_id: int) -> list[StreamView]:
-    return [_stream_view(stream) for stream in _campaign_rows(db, campaign_id)]
+    return [
+        _stream_view(stream)
+        for stream in _campaign_rows(db, campaign_id)
+        if not stream.missing or stream.draft is not None
+    ]
 
 
 def _import_flow(stream: StreamDraft, flow: Flow, names: dict[int, str]) -> None:
+    stream.conflict = False
+    if not flow.editable:
+        # A redirect can become an offer flow again. Keep the prior archive for that case.
+        return
+
     previous = {offer.id: offer for offer in _load(stream.published)}
-    received = {link.offer_id: link for link in flow.offers} if flow.editable else {}
+    received = {link.offer_id: link for link in flow.offers}
     offers = []
     removed = False
 
@@ -115,9 +124,8 @@ def _import_flow(stream: StreamDraft, flow: Flow, names: dict[int, str]) -> None
             )
         )
 
-    stream.published = _dump(offers) if flow.editable else []
-    stream.conflict = False
-    if removed and flow.editable:
+    stream.published = _dump(offers)
+    if removed:
         recalculated = allocate(offers)
         if recalculated != offers:
             stream.draft = _dump(recalculated)
@@ -231,6 +239,26 @@ def cancel_draft(db: Session, stream_id: int, version: int) -> StreamView:
     return _save(db, stream)
 
 
+def _current_offer_flow(db: Session, tracker: Keitaro, stream: StreamDraft) -> Flow:
+    try:
+        flow = tracker.stream(stream.id)
+    except KeitaroError as exc:
+        if exc.upstream_status != 404:
+            raise
+        flow = None
+
+    if flow is None or flow.state == "deleted":
+        stream.missing = True
+        _save(db, stream)
+        raise AppError(409, "Поток больше не доступен в Keitaro.")
+
+    if not flow.editable or flow.campaign_id != stream.campaign_id:
+        stream.conflict = True
+        _save(db, stream)
+        raise AppError(409, "Тип или кампания потока изменились. Загрузите потоки снова.")
+    return flow
+
+
 def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -> StreamView:
     stream = _require_stream(db, stream_id, version)
     _require_editable(stream)
@@ -243,19 +271,7 @@ def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -
         raise AppError(422, issue)
 
     desired = _links(draft)
-    try:
-        current = tracker.stream(stream_id)
-    except KeitaroError as exc:
-        if exc.upstream_status != 404:
-            raise
-        stream.missing = True
-        _save(db, stream)
-        raise AppError(409, "Поток больше не доступен в Keitaro.") from exc
-
-    if not current.editable or current.campaign_id != stream.campaign_id:
-        stream.conflict = True
-        _save(db, stream)
-        raise AppError(409, "Тип или кампания потока изменились. Загрузите потоки снова.")
+    current = _current_offer_flow(db, tracker, stream)
 
     if not _same_links(current.offers, desired):
         if not _same_links(current.offers, _links(_load(stream.published))):
@@ -269,7 +285,7 @@ def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -
             if not exc.uncertain:
                 raise
         try:
-            confirmed = tracker.stream(stream_id)
+            confirmed = _current_offer_flow(db, tracker, stream)
         except KeitaroError as exc:
             raise AppError(
                 502, "Публикация не подтверждена. Черновик сохранён. Загрузите потоки снова."

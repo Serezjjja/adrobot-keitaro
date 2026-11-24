@@ -97,7 +97,7 @@ export default function CreateCampaign({ onCreated, onBusyChange }) {
               <div className="field wide-field">
                 <label htmlFor="campaign-name">Название кампании</label>
                 <input id="campaign-name" name="name" value={form.name} onChange={changeField}
-                  placeholder={`${prefix}campaign1`} required maxLength={200} autoComplete="off" />
+                  placeholder={`${prefix}campaign1`} required maxLength={100} autoComplete="off" />
                 <p className="field-status">Префикс для тестовых кампаний — {prefix}</p>
               </div>
               <div className="field">

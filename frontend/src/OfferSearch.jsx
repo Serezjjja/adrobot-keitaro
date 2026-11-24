@@ -52,6 +52,12 @@ export default function OfferSearch({ value, onChange, disabled = false, exclude
     onChange(null)
   }
 
+  function selectOffer(offer) {
+    setQuery('')
+    setResults([])
+    onChange(offer)
+  }
+
   return (
     <div className="offer-search">
       <label htmlFor={id}>Оффер по ID или названию</label>
@@ -78,7 +84,7 @@ export default function OfferSearch({ value, onChange, disabled = false, exclude
         <ul className="search-results" aria-label="Найденные офферы">
           {available.slice(0, 20).map((offer) => (
             <li key={offer.id}>
-              <button type="button" onClick={() => onChange(offer)} disabled={disabled}>
+              <button type="button" onClick={() => selectOffer(offer)} disabled={disabled}>
                 <span className="numeric">#{offer.id}</span>
                 <span>{offer.name}</span>
               </button>

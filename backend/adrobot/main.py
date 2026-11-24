@@ -57,9 +57,11 @@ def list_campaigns(tracker: Tracker) -> list[Resource]:
 
 
 @router.post("/campaigns", status_code=201)
-def create_campaign(request: Request, tracker: Tracker, data: CreateCampaign) -> Resource:
+def create_campaign(request: Request, db: Db, tracker: Tracker, data: CreateCampaign) -> Resource:
     with request.app.state.mutations:
-        return campaigns.create_campaign(tracker, data, request.app.state.settings.campaign_prefix)
+        return campaigns.create_campaign(
+            db, tracker, data, request.app.state.settings.campaign_prefix
+        )
 
 
 @router.get("/offers")

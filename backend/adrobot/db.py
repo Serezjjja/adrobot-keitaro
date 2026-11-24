@@ -8,6 +8,15 @@ class Base(DeclarativeBase):
     pass
 
 
+class CampaignCreation(Base):
+    __tablename__ = "campaign_creations"
+
+    alias: Mapped[str] = mapped_column(String, primary_key=True)
+    request: Mapped[dict[str, Any]] = mapped_column(JSON)
+    campaign_id: Mapped[int | None] = mapped_column(Integer)
+    phase: Mapped[str] = mapped_column(String, default="building")
+
+
 class StreamDraft(Base):
     __tablename__ = "stream_drafts"
 

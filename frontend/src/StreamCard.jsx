@@ -25,19 +25,25 @@ export default function StreamCard({ stream, busy, locked, onAction, error, noti
             {stream.missing ? 'Поток отсутствует в Keitaro' : stream.dirty ? 'Есть неопубликованные изменения' : 'Изменений нет'}
           </p>
         </div>
-        {stream.editable && (stream.dirty || stream.conflict || stream.issue) && (
+        {stream.dirty && (
           <div className="stream-actions">
             <button type="button" onClick={() => onAction(stream, 'cancel')} disabled={busy || locked}>Отменить изменения</button>
-            <button className="primary" type="button" onClick={() => onAction(stream, 'publish')}
-              disabled={blocked || Boolean(stream.issue) || !stream.dirty}>
-              {busy ? 'Сохраняем…' : 'Опубликовать в Keitaro'}
-            </button>
+            {stream.editable && (
+              <button className="primary" type="button" onClick={() => onAction(stream, 'publish')}
+                disabled={blocked || Boolean(stream.issue)}>
+                {busy ? 'Сохраняем…' : 'Опубликовать в Keitaro'}
+              </button>
+            )}
           </div>
         )}
       </header>
 
-      {stream.conflict && <p className="notice error" role="alert">Поток изменён в Keitaro. Черновик сохранён. Отмените изменения и загрузите потоки заново.</p>}
-      {stream.missing && <p className="notice error" role="alert">Отмените черновик и загрузите потоки заново, чтобы принять актуальное состояние.</p>}
+      {stream.conflict && <p className="notice error" role="alert">{stream.dirty
+        ? 'Поток изменён в Keitaro. Черновик сохранён. Отмените изменения и загрузите потоки заново.'
+        : 'Поток изменён в Keitaro. Загрузите потоки заново, чтобы принять актуальное состояние.'}</p>}
+      {stream.missing && <p className="notice error" role="alert">{stream.dirty
+        ? 'Отмените черновик и загрузите потоки заново, чтобы принять актуальное состояние.'
+        : 'Загрузите потоки заново, чтобы принять актуальное состояние.'}</p>}
       {stream.issue && <p className="notice warning" role="alert">{stream.issue}</p>}
       {error && <p className="notice error" role="alert">{error}</p>}
       {notice && <p className="notice success" role="status">{notice}</p>}

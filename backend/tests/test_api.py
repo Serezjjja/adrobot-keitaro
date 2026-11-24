@@ -101,6 +101,31 @@ def test_campaign_timeout_checks_stable_alias_before_creating_again(client, fake
     assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 1
 
 
+def test_repeat_submission_does_not_enable_campaign_stopped_by_operator(client, fake):
+    created = client.post("/api/campaigns", json=CREATE_DATA).json()
+    fake.campaigns[created["id"]]["state"] = "disabled"
+    before = len(fake.calls)
+
+    repeated = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert repeated.status_code == 201
+    assert repeated.json() == created
+    assert fake.campaigns[created["id"]]["state"] == "disabled"
+    assert all(method == "GET" for method, _, _ in fake.calls[before:])
+
+
+def test_unconfirmed_activation_is_not_repeated_automatically(client, fake):
+    fake.timeout_during_enable = True
+    assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 502
+    fake.timeout_during_enable = False
+
+    retry = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert retry.status_code == 409
+    assert fake.campaigns[8]["state"] == "disabled"
+    assert sum(path.endswith("/enable") for _, path, _ in fake.calls) == 1
+
+
 def test_validation_does_not_write_to_tracker(client, fake):
     for invalid in [
         {"country": "XX"},
@@ -202,6 +227,55 @@ def test_publish_confirms_timeout_with_readback(client, fake):
     assert response.status_code == 200, response.text
     assert not response.json()["dirty"]
     assert sum(method == "PUT" for method, _, _ in fake.calls) == 1
+
+
+def test_deleted_stream_keeps_draft_until_cancel_without_writing(client, fake):
+    _, stream = sync(client)
+    draft = change(client, stream, "add", 14)
+    fake.streams[102]["state"] = "deleted"
+
+    assert publish(client, draft).status_code == 409
+    _, missing = sync(client)
+    assert missing["missing"] and missing["dirty"]
+    assert all(method != "PUT" for method, _, _ in fake.calls)
+
+    cancel(client, missing)
+    assert [stream["id"] for stream in sync(client)] == [101]
+
+
+def test_deleted_stream_does_not_confirm_put(client, fake):
+    _, stream = sync(client)
+    draft = change(client, stream, "add", 14)
+    fake.delete_after_put = True
+
+    assert publish(client, draft).status_code == 409
+    assert client.get("/api/campaigns/7/streams").json()[1]["dirty"]
+
+
+def test_schema_change_hides_offers_temporarily_and_preserves_archive(client, fake):
+    _, stream = sync(client)
+    assert publish(client, change(client, stream, "remove", 12)).status_code == 200
+    fake.streams[102]["schema"] = "redirect"
+
+    _, redirected = sync(client)
+    assert not redirected["editable"] and not redirected["offers"]
+
+    fake.streams[102]["schema"] = "landings"
+    _, restored = sync(client)
+    archived = next(offer for offer in restored["offers"] if offer["id"] == 12)
+    assert archived["removed"] and archived["share"] == 0
+
+
+def test_schema_change_allows_cancel_of_draft(client, fake):
+    _, stream = sync(client)
+    change(client, stream, "add", 14)
+    fake.streams[102]["schema"] = "redirect"
+
+    _, conflicted = sync(client)
+    assert conflicted["conflict"] and conflicted["dirty"] and not conflicted["editable"]
+    cancel(client, conflicted)
+    _, redirected = sync(client)
+    assert not redirected["dirty"] and not redirected["conflict"]
 
 
 def test_configuration_key_stays_server_side_and_draft_survives_restart(client, database_url, fake):

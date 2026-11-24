@@ -5,15 +5,13 @@ import StreamCard from './StreamCard.jsx'
 export default function CampaignEditor({ campaign, onBusyChange }) {
   const [streams, setStreams] = useState([])
   const [loading, setLoading] = useState(true)
-  const [syncing, setSyncing] = useState(false)
-  const [pending, setPending] = useState([])
+  const [activeOperation, setActiveOperation] = useState(null)
   const [errors, setErrors] = useState({})
   const [notices, setNotices] = useState({})
   const [error, setError] = useState('')
   const [loaded, setLoaded] = useState(false)
   const [loadAttempt, setLoadAttempt] = useState(0)
-  const pendingIds = useRef(new Set())
-  const syncInProgress = useRef(false)
+  const operationRef = useRef(null)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -31,11 +29,23 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
     return () => controller.abort()
   }, [campaign.id, loadAttempt])
 
-  async function sync() {
-    if (syncInProgress.current || pendingIds.current.size) return
-    syncInProgress.current = true
-    setSyncing(true)
+  function beginOperation(operation) {
+    // The ref closes the gap before React renders the disabled buttons.
+    if (operationRef.current !== null) return false
+    operationRef.current = operation
+    setActiveOperation(operation)
     onBusyChange(true)
+    return true
+  }
+
+  function finishOperation() {
+    operationRef.current = null
+    setActiveOperation(null)
+    onBusyChange(false)
+  }
+
+  async function sync() {
+    if (!beginOperation('sync')) return
     setError('')
     setNotices({})
     try {
@@ -46,18 +56,12 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
     } catch (error) {
       setError(error.message)
     } finally {
-      syncInProgress.current = false
-      setSyncing(false)
-      onBusyChange(false)
+      finishOperation()
     }
   }
 
   async function action(stream, operation, offerId) {
-    if (pendingIds.current.size || syncInProgress.current) return false
-    // The ref closes the gap before React renders the disabled buttons.
-    pendingIds.current.add(stream.id)
-    setPending([...pendingIds.current])
-    onBusyChange(true)
+    if (!beginOperation(stream.id)) return false
     setErrors((current) => ({ ...current, [stream.id]: '' }))
     setNotices((current) => ({ ...current, [stream.id]: '' }))
     const path = `/streams/${stream.id}`
@@ -70,7 +74,9 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
       } else {
         updated = await request(`${path}/draft`, { method: 'PATCH', body: { version: stream.version, action: operation, offer_id: offerId } })
       }
-      setStreams((current) => current.map((item) => item.id === updated.id ? updated : item))
+      setStreams((current) => current
+        .map((item) => item.id === updated.id ? updated : item)
+        .filter((item) => !(item.missing && !item.dirty)))
       if (operation === 'publish') {
         setNotices((current) => ({ ...current, [stream.id]: 'Изменения опубликованы в Keitaro.' }))
       }
@@ -86,9 +92,7 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
       }
       return false
     } finally {
-      pendingIds.current.delete(stream.id)
-      setPending([...pendingIds.current])
-      onBusyChange(pendingIds.current.size > 0)
+      finishOperation()
     }
   }
 
@@ -99,8 +103,8 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
           <h1 id="editor-heading">{campaign.name}</h1>
           <p className="numeric">Кампания #{campaign.id}</p>
         </div>
-        <button type="button" onClick={sync} disabled={loading || syncing || pending.length > 0}>
-          {syncing ? 'Загружаем из Keitaro…' : 'Загрузить потоки из Keitaro'}
+        <button type="button" onClick={sync} disabled={loading || activeOperation !== null}>
+          {activeOperation === 'sync' ? 'Загружаем из Keitaro…' : 'Загрузить потоки из Keitaro'}
         </button>
       </div>
       {error && <div className="notice error" role="alert">{error}</div>}
@@ -115,8 +119,8 @@ export default function CampaignEditor({ campaign, onBusyChange }) {
       {!loading && streams.length > 0 && (
         <div className="streams">
           {[...streams].sort((a, b) => a.position - b.position).map((stream) => (
-            <StreamCard key={stream.id} stream={stream} onAction={action} busy={pending.includes(stream.id)}
-              locked={syncing || (pending.length > 0 && !pending.includes(stream.id))}
+            <StreamCard key={stream.id} stream={stream} onAction={action} busy={activeOperation === stream.id}
+              locked={activeOperation !== null && activeOperation !== stream.id}
               error={errors[stream.id]} notice={notices[stream.id]} />
           ))}
         </div>
