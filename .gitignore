@@ -1,0 +1,22 @@
+# Local configuration and databases
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Frontend
+node_modules/
+dist/
+
+# Local tooling
+.DS_Store
+Thumbs.db
