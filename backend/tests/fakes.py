@@ -62,6 +62,7 @@ class FakeKeitaro:
         self.fail_stream_position: int | None = None
         self.timeout_after_put = False
         self.timeout_after_campaign = False
+        self.reject_campaign = False
         self.timeout_during_enable = False
         self.delete_after_put = False
 
@@ -75,6 +76,8 @@ class FakeKeitaro:
         if method == "GET":
             return self._get(request, path)
         if method == "POST" and path == "campaigns":
+            if self.reject_campaign:
+                return httpx.Response(422, json={"error": "invalid settings"})
             campaign_id = max(self.campaigns) + 1
             campaign = {**payload, "id": campaign_id}
             self.campaigns[campaign_id] = campaign

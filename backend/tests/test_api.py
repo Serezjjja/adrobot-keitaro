@@ -114,6 +114,28 @@ def test_repeat_submission_does_not_enable_campaign_stopped_by_operator(client, 
     assert all(method == "GET" for method, _, _ in fake.calls[before:])
 
 
+def test_completed_creation_does_not_open_an_archived_campaign(client, fake):
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+    campaign_id = response.json()["id"]
+    fake.campaigns[campaign_id]["state"] = "deleted"
+    assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 409
+
+    del fake.campaigns[campaign_id]
+    assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 409
+    assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 1
+
+
+def test_definite_creation_refusal_allows_corrected_parameters(client, fake):
+    fake.reject_campaign = True
+    assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 502
+    fake.reject_campaign = False
+
+    corrected = client.post("/api/campaigns", json={**CREATE_DATA, "country": "AU"})
+
+    assert corrected.status_code == 201, corrected.text
+    assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 2
+
+
 def test_unconfirmed_activation_is_not_repeated_automatically(client, fake):
     fake.timeout_during_enable = True
     assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 502

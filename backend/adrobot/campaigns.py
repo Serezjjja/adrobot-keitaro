@@ -114,13 +114,17 @@ def _validate_selection(tracker: Keitaro, data: CreateCampaign) -> None:
 
 
 def _ensure_campaign(
-    tracker: Keitaro, data: CreateCampaign, alias: str, references: dict[str, int]
+    db: Session,
+    tracker: Keitaro,
+    operation: CampaignCreation,
+    data: CreateCampaign,
+    references: dict[str, int],
 ) -> Campaign:
     try:
         return tracker.create_campaign(
             {
                 "name": data.name,
-                "alias": alias,
+                "alias": operation.alias,
                 "type": "position",
                 "state": "disabled",
                 **references,
@@ -128,8 +132,10 @@ def _ensure_campaign(
         )
     except KeitaroError as exc:
         if not exc.uncertain:
+            db.delete(operation)
+            db.commit()
             raise
-        campaign = _existing_campaign(tracker, data.name, alias)
+        campaign = _existing_campaign(tracker, data.name, operation.alias)
         if campaign is not None:
             return campaign
         raise AppError(
@@ -149,7 +155,16 @@ def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix:
     if operation is not None and operation.request != submission:
         raise AppError(409, "Для этого названия уже сохранены другие параметры создания.")
     if operation is not None and operation.phase == "complete":
-        return Resource(id=operation.campaign_id, name=data.name)
+        campaign_id = operation.campaign_id
+        try:
+            campaign = tracker.campaign(campaign_id)
+        except KeitaroError as exc:
+            if exc.upstream_status != 404:
+                raise
+            raise AppError(409, f"Кампания #{campaign_id} больше не доступна в Keitaro.") from exc
+        if campaign.state == "deleted":
+            raise AppError(409, f"Кампания #{campaign_id} находится в архиве Keitaro.")
+        return Resource(id=campaign.id, name=campaign.name)
 
     _validate_selection(tracker, data)
     references = data.model_dump(include={"domain_id", "group_id", "traffic_source_id"})
@@ -164,7 +179,7 @@ def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix:
         db.commit()
 
     if operation.campaign_id is None:
-        campaign = found or _ensure_campaign(tracker, data, alias, references)
+        campaign = found or _ensure_campaign(db, tracker, operation, data, references)
         operation.campaign_id = campaign.id
         db.commit()
 
