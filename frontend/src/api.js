@@ -1,8 +1,9 @@
 export class ApiError extends Error {
-  constructor(message, status) {
+  constructor(message, status, uncertain = false) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.uncertain = uncertain
   }
 }
 
@@ -18,6 +19,7 @@ function errorMessage(detail) {
 }
 
 export async function request(path, { body, ...options } = {}) {
+  const writing = !['GET', 'HEAD'].includes((options.method ?? 'GET').toUpperCase())
   let response
   try {
     response = await fetch(`/api${path}`, {
@@ -26,16 +28,19 @@ export async function request(path, { body, ...options } = {}) {
       body: body === undefined ? undefined : JSON.stringify(body),
     })
   } catch (error) {
-    if (error.name === 'AbortError') throw error
-    throw new ApiError('Соединение с сервером прервано. Проверьте состояние перед повтором операции.', 0)
+    if (error.name === 'AbortError' && !writing) throw error
+    throw new ApiError('Соединение с сервером прервано. Проверьте состояние перед повтором операции.', 0, writing)
   }
 
-  const data = await response.json().catch(() => null)
+  const data = await response.json().catch((error) => {
+    if (error.name === 'AbortError' && !writing) throw error
+    return null
+  })
   if (!response.ok) {
-    throw new ApiError(errorMessage(data?.detail), response.status)
+    throw new ApiError(errorMessage(data?.detail), response.status, writing && response.status >= 500)
   }
   if (data === null && response.status !== 204) {
-    throw new ApiError('Сервер вернул неожиданный ответ. Проверьте адрес API и состояние операции.', response.status)
+    throw new ApiError('Сервер вернул неожиданный ответ. Проверьте адрес API и состояние операции.', response.status, writing)
   }
   return data
 }

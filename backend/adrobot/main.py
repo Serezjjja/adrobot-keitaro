@@ -2,6 +2,7 @@ from collections.abc import Generator
 from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Annotated
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, Path, Query, Request
@@ -13,10 +14,18 @@ from adrobot import campaigns, editor
 from adrobot.config import Settings
 from adrobot.errors import AppError
 from adrobot.keitaro import Keitaro
-from adrobot.schema import Catalogs, CreateCampaign, DraftChange, DraftVersion, Resource, StreamView
+from adrobot.schema import (
+    MAX_SAFE_ID,
+    Catalogs,
+    CreateCampaign,
+    DraftChange,
+    DraftVersion,
+    Resource,
+    StreamView,
+)
 
 router = APIRouter(prefix="/api")
-ResourceId = Annotated[int, Path(gt=0)]
+ResourceId = Annotated[int, Path(gt=0, le=MAX_SAFE_ID)]
 
 
 def get_session(request: Request) -> Generator[Session, None, None]:
@@ -39,7 +48,12 @@ def health() -> dict[str, str]:
 
 @router.get("/settings")
 def settings(request: Request) -> dict[str, str]:
-    return {"campaign_prefix": request.app.state.settings.campaign_prefix}
+    config = request.app.state.settings
+    base = urlsplit(str(config.keitaro_base_url))
+    admin_url = urlunsplit(
+        (base.scheme, base.netloc.rsplit("@", 1)[-1], f"{base.path.rstrip('/')}/admin/", "", "")
+    )
+    return {"campaign_prefix": config.campaign_prefix, "keitaro_admin_url": admin_url}
 
 
 @router.get("/catalogs")
@@ -65,8 +79,14 @@ def create_campaign(request: Request, db: Db, tracker: Tracker, data: CreateCamp
 
 
 @router.get("/offers")
-def offers(tracker: Tracker, q: Annotated[str, Query(max_length=100)] = "") -> list[Resource]:
-    return campaigns.search_offers(tracker, q)
+def offers(
+    tracker: Tracker,
+    db: Db,
+    q: Annotated[str, Query(max_length=100)] = "",
+    stream_id: Annotated[int | None, Query(gt=0, le=MAX_SAFE_ID)] = None,
+) -> list[Resource]:
+    exclude_ids = editor.attached_offer_ids(db, stream_id) if stream_id is not None else set()
+    return campaigns.search_offers(tracker, q, exclude_ids=exclude_ids)
 
 
 @router.get("/campaigns/{campaign_id}/streams")
@@ -92,7 +112,10 @@ def edit_draft(
 
 @router.delete("/streams/{stream_id}/draft")
 def cancel_draft(
-    request: Request, stream_id: ResourceId, db: Db, version: Annotated[int, Query(ge=1)]
+    request: Request,
+    stream_id: ResourceId,
+    db: Db,
+    version: Annotated[int, Query(ge=1, le=MAX_SAFE_ID)],
 ) -> StreamView:
     with request.app.state.mutations:
         return editor.cancel_draft(db, stream_id, version)
@@ -117,9 +140,13 @@ def create_app(
         application.state.sessions = sessionmaker(engine, expire_on_commit=False)
         # One API worker owns draft mutations, including the read/PUT/read sequence in Keitaro.
         application.state.mutations = Lock()
+        base = urlsplit(str(config_values.keitaro_base_url))
+        api_url = urlunsplit(
+            (base.scheme, base.netloc, f"{base.path.rstrip('/')}/admin_api/v1/", "", "")
+        )
         try:
             with httpx.Client(
-                base_url=f"{str(config_values.keitaro_base_url).rstrip('/')}/admin_api/v1/",
+                base_url=api_url,
                 headers={"Api-Key": config_values.keitaro_api_key.get_secret_value()},
                 timeout=8.0,
                 transport=transport,

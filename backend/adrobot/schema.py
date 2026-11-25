@@ -1,9 +1,12 @@
 from typing import Annotated, Any, Literal
 
 import pycountry
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
-PositiveId = Annotated[int, Field(gt=0)]
+# IDs travel as JSON numbers and must remain exact in the React client.
+MAX_SAFE_ID = 2**53 - 1
+PositiveId = Annotated[int, Field(gt=0, le=MAX_SAFE_ID)]
+InputId = Annotated[PositiveId, Field(strict=True)]
 Share = Annotated[int, Field(ge=0, le=100)]
 OfferState = Literal["active", "disabled"]
 
@@ -23,7 +26,8 @@ class TrackerResource(Resource):
 
 class Campaign(Resource):
     alias: str | None = None
-    state: str = "active"
+    state: str
+    type: str | None = None
     domain_id: int | None = None
     group_id: int | None = None
     traffic_source_id: int | None = None
@@ -32,7 +36,7 @@ class Campaign(Resource):
 class FlowOffer(BaseModel):
     offer_id: PositiveId
     share: Share
-    state: OfferState = "active"
+    state: OfferState
 
 
 class Flow(Resource):
@@ -52,6 +56,14 @@ class Flow(Resource):
     def editable(self) -> bool:
         return self.routing == "landings"
 
+    @model_validator(mode="after")
+    def validate_offer_links(self) -> "Flow":
+        if self.editable and self.state != "deleted" and "offers" not in self.model_fields_set:
+            raise ValueError("Keitaro не вернул список офферов для потока.")
+        if len({link.offer_id for link in self.offers}) != len(self.offers):
+            raise ValueError("Keitaro вернул повторяющиеся офферы потока.")
+        return self
+
 
 class Catalogs(BaseModel):
     domains: list[Resource]
@@ -62,10 +74,10 @@ class Catalogs(BaseModel):
 class CreateCampaign(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     country: str
-    offer_id: PositiveId
-    domain_id: PositiveId
-    group_id: PositiveId
-    traffic_source_id: PositiveId
+    offer_id: InputId
+    domain_id: InputId
+    group_id: InputId
+    traffic_source_id: InputId
 
     @field_validator("name", mode="before")
     @classmethod
@@ -89,12 +101,22 @@ class Offer(Resource):
 
 
 class DraftVersion(BaseModel):
-    version: int = Field(ge=1)
+    version: InputId
 
 
 class DraftChange(DraftVersion):
-    action: Literal["add", "remove", "restore", "pin", "unpin"]
-    offer_id: PositiveId
+    action: Literal["add", "remove", "restore", "pin", "unpin", "set_share"]
+    offer_id: InputId
+    share: int | None = Field(default=None, strict=True, ge=0, le=100, validate_default=True)
+
+    @field_validator("share", mode="before")
+    @classmethod
+    def require_share_for_set_share(cls, value: Any, info: ValidationInfo) -> Any:
+        if info.data.get("action") != "set_share":
+            return None
+        if value is None:
+            raise ValueError("Укажите целую долю от 0 до 100.")
+        return value
 
 
 class StreamView(Resource):
@@ -103,6 +125,8 @@ class StreamView(Resource):
     dirty: bool
     conflict: bool
     missing: bool
+    publication_pending: bool = False
     version: int
     issue: str | None
     offers: list[Offer]
+    published_offers: list[Offer] | None = None

@@ -1,0 +1,13 @@
+/* Campaign selection and creation additions. */
+.campaign-picker { max-width: 570px; }
+.campaign-create-action { margin-top: 22px; }
+.campaign-field-error { margin: 6px 0 0; color: #ffaaa9; font-size: 12px; }
+.create-form [aria-invalid="true"] { border-color: #d8797d; }
+.campaign-preview { display: grid; gap: 8px; margin-top: 24px; padding: 16px; border: 1px solid #36383c; border-radius: 12px; background: #202123; font-size: 13px; }
+.campaign-preview strong { font-size: 14px; }
+.campaign-preview > div { display: flex; flex-wrap: wrap; gap: 8px; color: #d4d5d9; overflow-wrap: anywhere; }
+.campaign-preview > div span:last-child { color: #fbfbfb; font-weight: 700; }
+@media (max-width: 480px) {
+  .empty-state { padding: 20px; }
+  .campaign-preview { padding: 12px; }
+}

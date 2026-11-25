@@ -32,8 +32,12 @@ class Keitaro:
         try:
             response = self.http.request(method, path, json=payload, params=params)
         except httpx.RequestError as exc:
+            before_send = isinstance(
+                exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+            )
             raise KeitaroError(
-                "Keitaro не ответил. Проверьте соединение и повторите запрос.", uncertain=write
+                "Keitaro не ответил. Проверьте соединение и повторите запрос.",
+                uncertain=write and not before_send,
             ) from exc
 
         if response.is_error or response.is_redirect:
@@ -53,6 +57,14 @@ class Keitaro:
     def campaigns(self) -> list[Campaign]:
         return self._request("GET", "campaigns", CAMPAIGNS.validate_python)
 
+    def _get_resource[T: Resource](
+        self, collection: str, resource_id: int, parse: Callable[[Any], T]
+    ) -> T:
+        resource = self._request("GET", f"{collection}/{resource_id}", parse)
+        if resource.id != resource_id:
+            raise KeitaroError(f"Keitaro вернул объект с другим ID вместо #{resource_id}.")
+        return resource
+
     def create_campaign(self, payload: dict[str, Any]) -> Campaign:
         return self._request("POST", "campaigns", Campaign.model_validate, payload=payload)
 
@@ -60,7 +72,7 @@ class Keitaro:
         self._request("POST", f"campaigns/{campaign_id}/enable", lambda value: value)
 
     def campaign(self, campaign_id: int) -> Campaign:
-        return self._request("GET", f"campaigns/{campaign_id}", Campaign.model_validate)
+        return self._get_resource("campaigns", campaign_id, Campaign.model_validate)
 
     def catalogs(self) -> Catalogs:
         return Catalogs(
@@ -81,7 +93,7 @@ class Keitaro:
 
     def active_offer(self, offer_id: int) -> Resource:
         try:
-            item = self._request("GET", f"offers/{offer_id}", TrackerResource.model_validate)
+            item = self._get_resource("offers", offer_id, TrackerResource.model_validate)
         except KeitaroError as exc:
             if exc.upstream_status == 404:
                 raise AppError(422, f"Оффер #{offer_id} не найден в Keitaro.") from exc
@@ -91,10 +103,15 @@ class Keitaro:
         return Resource(id=item.id, name=item.name)
 
     def streams(self, campaign_id: int) -> list[Flow]:
-        return self._request("GET", f"campaigns/{campaign_id}/streams", FLOWS.validate_python)
+        flows = self._request("GET", f"campaigns/{campaign_id}/streams", FLOWS.validate_python)
+        if any(flow.campaign_id != campaign_id for flow in flows):
+            raise KeitaroError(f"Keitaro вернул потоки другой кампании вместо #{campaign_id}.")
+        if len({flow.id for flow in flows}) != len(flows):
+            raise KeitaroError(f"Keitaro вернул повторяющиеся потоки кампании #{campaign_id}.")
+        return flows
 
     def stream(self, stream_id: int) -> Flow:
-        return self._request("GET", f"streams/{stream_id}", Flow.model_validate)
+        return self._get_resource("streams", stream_id, Flow.model_validate)
 
     def create_stream(self, payload: dict[str, Any]) -> Flow:
         return self._request("POST", "streams", Flow.model_validate, payload=payload)

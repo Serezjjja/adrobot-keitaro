@@ -1,97 +1,64 @@
-import { useEffect, useId, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { request } from './api.js'
+import ResourceSearch from './ResourceSearch.jsx'
 
-export default function OfferSearch({ value, onChange, disabled = false, excludeIds = [] }) {
-  const id = useId()
+export default function OfferSearch({ value, onChange, disabled = false, excludeIds = [], streamId, fieldError, onFieldEdit }) {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [searched, setSearched] = useState(false)
+  const [result, setResult] = useState(null)
+  const [attempt, setAttempt] = useState(0)
+  const term = !value && !disabled ? query.trim().replace(/^#(?=\d)/, '') : ''
 
   useEffect(() => {
-    if (!query.trim() || value || disabled) {
-      setResults([])
-      setLoading(false)
-      setSearched(false)
-      return
-    }
-
+    if (!term) return
     const controller = new AbortController()
-    setLoading(true)
-    setError('')
-    setSearched(false)
     const timer = setTimeout(async () => {
       try {
-        const offers = await request(`/offers?q=${encodeURIComponent(query.trim())}`, {
+        const offers = await request(`/offers?q=${encodeURIComponent(term)}${streamId == null ? '' : '&stream_id=' + streamId}`, {
           signal: controller.signal,
         })
-        if (!controller.signal.aborted) {
-          setResults(offers)
-          setSearched(true)
-        }
+        if (!controller.signal.aborted) setResult({ term, attempt, offers })
       } catch (error) {
-        if (error.name !== 'AbortError') setError(error.message)
-      } finally {
-        if (!controller.signal.aborted) setLoading(false)
+        if (!controller.signal.aborted) setResult({ term, attempt, error: error.message })
       }
     }, 250)
-
-    // A new query invalidates the previous result, including during the debounce.
     return () => {
       clearTimeout(timer)
       controller.abort()
     }
-  }, [query, value, disabled])
+  }, [term, attempt, streamId, excludeIds.join(',')])
 
-  const available = results.filter((offer) => !excludeIds.includes(offer.id))
-
-  function editQuery(event) {
-    setQuery(event.target.value)
-    setResults([])
-    onChange(null)
-  }
-
-  function selectOffer(offer) {
-    setQuery('')
-    setResults([])
-    onChange(offer)
-  }
+  const current = term && result?.term === term && result.attempt === attempt ? result : null
+  const excluded = new Set(excludeIds.map(String))
+  const available = current?.offers?.filter((offer) => !excluded.has(String(offer.id))) ?? []
+  const status = term && !current ? 'Ищем офферы…'
+    : value ? `Выбран оффер #${value.id}`
+      : current?.offers && available.length === 0
+        ? current.offers.length ? 'Все найденные офферы уже добавлены в поток.' : 'Офферы не найдены.'
+        : ''
 
   return (
-    <div className="offer-search">
-      <label htmlFor={id}>Оффер по ID или названию</label>
-      <input
-        id={id}
-        type="search"
-        autoComplete="off"
-        value={value ? `#${value.id} · ${value.name}` : query}
-        onChange={editQuery}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter') event.preventDefault()
-        }}
-        disabled={disabled}
-        aria-describedby={`${id}-status`}
-        placeholder="Начните вводить ID или название"
-      />
-      <div id={`${id}-status`} className="field-status" role="status">
-        {loading && 'Поиск…'}
-        {value && `Выбран оффер #${value.id}`}
-        {!loading && !value && searched && available.length === 0 && 'Подходящих офферов нет.'}
-      </div>
-      {error && <p className="error" role="alert">{error}</p>}
-      {available.length > 0 && !value && (
-        <ul className="search-results" aria-label="Найденные офферы">
-          {available.slice(0, 20).map((offer) => (
-            <li key={offer.id}>
-              <button type="button" onClick={() => selectOffer(offer)} disabled={disabled}>
-                <span className="numeric">#{offer.id}</span>
-                <span>{offer.name}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+    <ResourceSearch
+      className="offer-search"
+      fieldError={fieldError}
+      onFieldEdit={onFieldEdit}
+      label="Оффер по ID или названию"
+      placeholder="Например, #123"
+      value={value}
+      query={value ? `#${value.id} · ${value.name}` : query}
+      onQueryChange={(nextQuery) => {
+        setQuery(nextQuery)
+        if (value) onChange(null)
+      }}
+      onChange={(offer) => {
+        setQuery('')
+        setResult(null)
+        onChange(offer)
+      }}
+      options={available}
+      disabled={disabled}
+      status={status}
+      error={current?.error}
+      onRetry={() => setAttempt((previous) => previous + 1)}
+    />
   )
 }

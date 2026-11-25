@@ -54,3 +54,35 @@ test('network errors explain that an operation needs verification before retryin
     return true
   })
 })
+
+test('preserves cancellation while reading the response body', async () => {
+  const abort = new DOMException('The request was aborted', 'AbortError')
+  globalThis.fetch = async () => ({
+    ok: true, status: 200, json: async () => { throw abort },
+  })
+  await assert.rejects(request('/offers?q=old'), (error) => error === abort)
+})
+
+for (const failure of ['network', 'body', 'abort-body', 502, 503, 504]) {
+  test(`marks a publication outcome uncertain after ${failure}`, async () => {
+    globalThis.fetch = async () => {
+      if (failure === 'network') throw new TypeError('network')
+      if (typeof failure === 'number') return Response.json({ detail: 'Gateway failure' }, { status: failure })
+      return { ok: true, status: 200, json: async () => {
+        throw failure === 'abort-body' ? new DOMException('aborted', 'AbortError') : new TypeError('interrupted')
+      } }
+    }
+    await assert.rejects(request('/streams/12/publish', { method: 'POST' }), (error) => {
+      assert.equal(error.uncertain, true)
+      return true
+    })
+  })
+}
+
+test('an explicit rejected publication is safe to retry', async () => {
+  globalThis.fetch = async () => Response.json({ detail: 'Conflict' }, { status: 409 })
+  await assert.rejects(request('/streams/12/publish', { method: 'POST' }), (error) => {
+    assert.equal(error.uncertain, false)
+    return true
+  })
+})
