@@ -6,6 +6,8 @@
 
 Нужны Python 3.12 или новее, uv и Node.js 22.12 или новее с npm. Ниже команды PowerShell. [Установка uv](https://docs.astral.sh/uv/getting-started/installation/)
 
+### Настройка Keitaro
+
 ```powershell
 git clone https://github.com/Serezjjja/adrobot-keitaro.git
 cd adrobot-keitaro
@@ -17,15 +19,19 @@ Copy-Item .env.example .env
 
 `KEITARO_BASE_URL` в шаблоне уже указывает на эмулятор. `DATABASE_URL=sqlite:///./adrobot.db` создаёт базу в рабочем каталоге backend. Для другого аккаунта укажите отдельный файл. Ключ читает сервер, а Git игнорирует локальный `.env`.
 
-В первом терминале, из `backend`, выполните
+### Миграции и запуск API
+
+В первом терминале оставайтесь в каталоге `backend`. Команда Alembic создаст таблицы на пустой базе или обновит существующую базу до последней ревизии.
 
 ```powershell
 uv sync --locked
-uv run alembic upgrade head
-uv run uvicorn adrobot.main:app --host 127.0.0.1 --port 8000
+uv run --locked alembic upgrade head
+uv run --locked uvicorn adrobot.main:app --host 127.0.0.1 --port 8000
 ```
 
-Во втором терминале, из корня клона, выполните
+### Запуск фронтенда
+
+Откройте второй терминал в корне клона и выполните команды.
 
 ```powershell
 cd frontend
