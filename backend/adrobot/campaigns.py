@@ -60,7 +60,7 @@ def _matches_flow(flow: Flow, definition: dict[str, Any]) -> bool:
     return (
         flow.position == definition["position"]
         and flow.name == definition["name"]
-        and flow.type == definition["type"]
+        and ("type" not in flow.model_fields_set or flow.type == definition["type"])
         and flow.routing == definition["schema"]
         and flow.action_type == definition["action_type"]
         and (
@@ -69,8 +69,9 @@ def _matches_flow(flow: Flow, definition: dict[str, Any]) -> bool:
         )
         and "state" in flow.model_fields_set
         and flow.state == "active"
+        and flow.collect_clicks is not False
         and not flow.filter_or
-        and filters == definition["filters"]
+        and ("filters" not in flow.model_fields_set or filters == definition["filters"])
         and not flow.landings
         and flow.offers == [FlowOffer.model_validate(item) for item in definition.get("offers", [])]
     )
@@ -92,6 +93,18 @@ def _checked_flows(
             or not _matches_flow(flow, definition)
         ):
             raise AppError(409, f"Кампания #{campaign_id} уже содержит другие потоки.")
+        required_fields = {"type", "filters"}
+        if "landings" in definition:
+            required_fields.add("landings")
+        if not required_fields <= flow.model_fields_set:
+            # Карточка уточняет пропущенное поле, но не отменяет противоречия в списке.
+            detail = tracker.stream(flow.id)
+            if (
+                detail.campaign_id != campaign_id
+                or not required_fields <= detail.model_fields_set
+                or not _matches_flow(detail, definition)
+            ):
+                raise AppError(409, f"Кампания #{campaign_id} уже содержит другие потоки.")
         positions.add(flow.position)
     return positions
 
@@ -135,8 +148,7 @@ def _ensure_campaign(
             db.delete(operation)
             db.commit()
             raise
-        # A prior POST may have succeeded even if this retry is definitely rejected.
-        # Keep its ownership token until the remote list confirms what happened.
+        # Предыдущий POST мог пройти: отказ при повторе ещё не опровергает принадлежность.
         campaign = _existing_campaign(tracker, settings["name"], operation.remote_alias)
         if campaign is not None:
             return campaign
@@ -145,40 +157,48 @@ def _ensure_campaign(
         ) from exc
 
 
-def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix: str) -> Resource:
+def _validate_name(name: str, prefix: str) -> None:
     if (
-        data.name == prefix
-        or not data.name.startswith(prefix)
-        or not re.fullmatch(r"test_[a-z0-9]+_.+", data.name)
+        name == prefix
+        or not name.startswith(prefix)
+        or not re.fullmatch(r"test_[a-z0-9]+_.+", name)
     ):
         expected = prefix if prefix != "test_" else "test_фамилия_"
         raise AppError(422, f"Начните название с {expected} и добавьте имя кампании.")
 
+
+def _completed_creation(tracker: Keitaro, operation: CampaignCreation) -> Resource:
+    campaign_id = operation.campaign_id
+    try:
+        campaign = tracker.campaign(campaign_id)
+    except KeitaroError as exc:
+        if exc.upstream_status != 404:
+            raise
+        raise AppError(409, f"Кампания #{campaign_id} больше не доступна в Keitaro.") from exc
+    if campaign.state == "deleted":
+        raise AppError(409, f"Кампания #{campaign_id} находится в архиве Keitaro.")
+    if campaign.name != operation.request["name"] or campaign.alias != (
+        operation.remote_alias or operation.alias
+    ):
+        raise AppError(409, f"Кампания #{campaign_id} уже имеет другие настройки.")
+    return Resource(id=campaign.id, name=campaign.name)
+
+
+def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix: str) -> Resource:
+    _validate_name(data.name, prefix)
     alias = "adrobot-" + sha256(data.name.encode()).hexdigest()[:24]
     operation = db.get(CampaignCreation, alias)
     submission = data.model_dump()
     if operation is not None and operation.request != submission:
         raise AppError(409, "Для этого названия уже сохранены другие параметры создания.")
     if operation is not None and operation.phase == "complete":
-        campaign_id = operation.campaign_id
-        try:
-            campaign = tracker.campaign(campaign_id)
-        except KeitaroError as exc:
-            if exc.upstream_status != 404:
-                raise
-            raise AppError(409, f"Кампания #{campaign_id} больше не доступна в Keitaro.") from exc
-        if campaign.state == "deleted":
-            raise AppError(409, f"Кампания #{campaign_id} находится в архиве Keitaro.")
-        if campaign.name != data.name or campaign.alias != (operation.remote_alias or alias):
-            raise AppError(409, f"Кампания #{campaign_id} уже имеет другие настройки.")
-        return Resource(id=campaign.id, name=campaign.name)
+        return _completed_creation(tracker, operation)
 
     _validate_selection(tracker, data)
     resuming = operation is not None and operation.remote_alias is not None
     if operation is None or operation.campaign_id is None:
         if operation is None or operation.remote_alias is None:
-            # Old reservations without a confirmed ID cannot prove remote ownership.
-            # Check their predictable alias only for conflicts, never for adoption.
+            # Старая запись без ID не доказывает принадлежность кампании по известному alias.
             found = _existing_campaign(tracker, data.name, alias)
             if found is not None:
                 raise AppError(409, f"Название уже используется кампанией #{found.id}.")
@@ -186,6 +206,7 @@ def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix:
                 operation = CampaignCreation(alias=alias, request=submission)
                 db.add(operation)
             operation.remote_alias = "adrobot-" + uuid4().hex
+            # Сохраняем случайный alias до POST, чтобы распознать кампанию при потере ответа.
             db.commit()
 
         else:
@@ -198,22 +219,35 @@ def create_campaign(db: Session, tracker: Keitaro, data: CreateCampaign, prefix:
         "alias": operation.remote_alias or alias,
         "type": "position",
     }
-    if operation.campaign_id is None:
-        campaign = found or _ensure_campaign(db, tracker, operation, settings, resuming=resuming)
-        operation.campaign_id = campaign.id
-        db.commit()
+    campaign_id = operation.campaign_id
+    if campaign_id is None:
+        candidate = found or _ensure_campaign(db, tracker, operation, settings, resuming=resuming)
+        campaign_id = candidate.id
 
     try:
-        _finish_creation(db, tracker, operation, data, settings)
+        campaign = None
+        if operation.campaign_id is None:
+            # Ответ POST может содержать чужой ID; принадлежность проверяем до его записи.
+            campaign = _checked_campaign(tracker, campaign_id, settings)
+            operation.campaign_id = campaign.id
+            db.commit()
+        _finish_creation(db, tracker, operation, data, settings, campaign=campaign)
     except KeitaroError as exc:
         raise AppError(
             exc.status,
-            f"Кампания #{operation.campaign_id}. {exc} "
+            f"Кампания #{campaign_id}. {exc} "
             "Повторите запрос с теми же данными, чтобы проверить результат.",
         ) from exc
     operation.phase = "complete"
     db.commit()
     return Resource(id=operation.campaign_id, name=data.name)
+
+
+def _checked_campaign(tracker: Keitaro, campaign_id: int, settings: dict[str, Any]) -> Campaign:
+    campaign = tracker.campaign(campaign_id)
+    if campaign.model_dump(include=set(settings)) != settings:
+        raise AppError(409, f"Кампания #{campaign_id} уже имеет другие настройки.")
+    return campaign
 
 
 def _finish_creation(
@@ -222,35 +256,21 @@ def _finish_creation(
     operation: CampaignCreation,
     data: CreateCampaign,
     settings: dict[str, Any],
+    *,
+    campaign: Campaign | None = None,
 ) -> None:
     campaign_id = operation.campaign_id
     definitions = _flow_definitions(data)
-    campaign = tracker.campaign(campaign_id)
-    if campaign.model_dump(include=set(settings)) != settings:
-        raise AppError(409, f"Кампания #{campaign_id} уже имеет другие настройки.")
+    if campaign is None:
+        campaign = _checked_campaign(tracker, campaign_id, settings)
 
-    flows = _checked_flows(tracker, campaign_id, definitions)
-    # A migrated attempt has no trustworthy dispatch history. Both positions may
-    # already have been sent, so only their confirmed presence permits resuming.
-    submitted = (
-        {definition["position"] for definition in definitions}
-        if operation.submitted_stream_positions is None
-        else set(operation.submitted_stream_positions)
-    )
-    missing = submitted - flows
-    if missing:
-        positions = ", ".join(str(position) for position in sorted(missing))
-        raise AppError(
-            502,
-            f"Кампания #{campaign_id}: Keitaro не подтвердил ранее отправленные потоки "
-            f"на позициях {positions}. Проверьте их в Keitaro перед продолжением.",
-        )
-    # Record observed progress as well as intent; a stale list must never cause another POST.
-    submitted |= flows
-    operation.submitted_stream_positions = sorted(submitted)
+    confirmed_positions = _checked_flows(tracker, campaign_id, definitions)
+    _validate_submitted_positions(operation, definitions, confirmed_positions)
+    # Учитываем найденные потоки, чтобы запоздавший список не вызвал повторный POST.
+    operation.submitted_stream_positions = sorted(confirmed_positions)
     db.commit()
     if campaign.state == "active":
-        if len(flows) == len(definitions):
+        if len(confirmed_positions) == len(definitions):
             return
         raise AppError(409, f"Кампания #{campaign_id} активна, но настроена не полностью.")
     if campaign.state != "disabled":
@@ -260,17 +280,53 @@ def _finish_creation(
             409, f"Включение кампании #{campaign_id} не подтверждено. Проверьте её в Keitaro."
         )
 
+    _create_missing_flows(db, tracker, operation, definitions, confirmed_positions)
+    if len(_checked_flows(tracker, campaign_id, definitions)) != len(definitions):
+        raise AppError(502, f"Keitaro не подтвердил два потока для кампании #{campaign_id}.")
+    # Оффер мог стать недоступен за время создания потоков.
+    tracker.active_offer(data.offer_id)
+    _activate_campaign(db, tracker, operation, settings)
+
+
+def _validate_submitted_positions(
+    operation: CampaignCreation, definitions: list[dict[str, Any]], confirmed_positions: set[int]
+) -> None:
+    # У старой записи нет истории отправки: обе позиции могли уже попасть в Keitaro.
+    submitted = (
+        {definition["position"] for definition in definitions}
+        if operation.submitted_stream_positions is None
+        else set(operation.submitted_stream_positions)
+    )
+    missing = submitted - confirmed_positions
+    if missing:
+        positions = ", ".join(str(position) for position in sorted(missing))
+        raise AppError(
+            502,
+            f"Кампания #{operation.campaign_id}: Keitaro не подтвердил ранее отправленные потоки "
+            f"на позициях {positions}. Проверьте их в Keitaro перед продолжением.",
+        )
+
+
+def _create_missing_flows(
+    db: Session,
+    tracker: Keitaro,
+    operation: CampaignCreation,
+    definitions: list[dict[str, Any]],
+    confirmed_positions: set[int],
+) -> None:
+    submitted = set(confirmed_positions)
     for definition in definitions:
         position = definition["position"]
-        if position not in flows:
+        if position not in confirmed_positions:
             submitted.add(position)
             operation.submitted_stream_positions = sorted(submitted)
+            # Записываем намерение до POST: потеря ответа не должна дублировать поток.
             db.commit()
             try:
                 tracker.create_stream(
                     {
                         **definition,
-                        "campaign_id": campaign_id,
+                        "campaign_id": operation.campaign_id,
                         "state": "active",
                         "collect_clicks": True,
                         "filter_or": False,
@@ -282,10 +338,19 @@ def _finish_creation(
                     operation.submitted_stream_positions = sorted(submitted)
                     db.commit()
                 raise
-    if len(_checked_flows(tracker, campaign_id, definitions)) != len(definitions):
-        raise AppError(502, f"Keitaro не подтвердил два потока для кампании #{campaign_id}.")
 
-    # An ambiguous enable must never turn a subsequently stopped campaign back on.
+
+def _activate_campaign(
+    db: Session, tracker: Keitaro, operation: CampaignCreation, settings: dict[str, Any]
+) -> None:
+    campaign_id = operation.campaign_id
+    # За время создания потоков оператор мог изменить настройки или состояние кампании.
+    campaign = _checked_campaign(tracker, campaign_id, settings)
+    if campaign.state == "active":
+        return
+    if campaign.state != "disabled":
+        raise AppError(409, f"Кампания #{campaign_id} в неподдерживаемом состоянии.")
+    # После неопределённого enable нельзя автоматически включать остановленную кампанию.
     operation.phase = "activating"
     db.commit()
     try:
@@ -295,5 +360,5 @@ def _finish_creation(
             operation.phase = "building"
             db.commit()
             raise
-    if tracker.campaign(campaign_id).state != "active":
+    if _checked_campaign(tracker, campaign_id, settings).state != "active":
         raise AppError(502, f"Keitaro не подтвердил включение кампании #{campaign_id}.")

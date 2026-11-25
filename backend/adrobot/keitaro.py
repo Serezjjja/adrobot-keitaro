@@ -91,6 +91,32 @@ class Keitaro:
     def offers(self) -> list[TrackerResource]:
         return self._request("GET", "offers", RESOURCES.validate_python)
 
+    def active_offer_ids(self, offer_ids: set[int]) -> set[int]:
+        if not offer_ids:
+            return set()
+        states: dict[int, set[str | None]] = {}
+        for item in self.offers():
+            if item.id in offer_ids:
+                states.setdefault(item.id, set()).add(item.state)
+
+        active = set()
+        for offer_id, observed in states.items():
+            # Явный запрет важнее активного дубля или неполной записи каталога.
+            if observed - {None, "active"}:
+                continue
+            if observed == {"active"}:
+                active.add(offer_id)
+                continue
+            try:
+                item = self._get_resource("offers", offer_id, TrackerResource.model_validate)
+            except KeitaroError as exc:
+                if exc.upstream_status == 404:
+                    continue
+                raise
+            if item.state == "active":
+                active.add(offer_id)
+        return active
+
     def active_offer(self, offer_id: int) -> Resource:
         try:
             item = self._get_resource("offers", offer_id, TrackerResource.model_validate)
@@ -98,7 +124,12 @@ class Keitaro:
             if exc.upstream_status == 404:
                 raise AppError(422, f"Оффер #{offer_id} не найден в Keitaro.") from exc
             raise
-        if not item.available:
+        available = item.state == "active"
+        if item.state is None:
+            # Неполная карточка не подтверждает доступность без явного состояния в каталоге.
+            states = {offer.state for offer in self.offers() if offer.id == offer_id}
+            available = "active" in states and not states - {None, "active"}
+        if not available:
             raise AppError(422, f"Оффер #{offer_id} недоступен в Keitaro.")
         return Resource(id=item.id, name=item.name)
 

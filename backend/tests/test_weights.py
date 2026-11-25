@@ -1,6 +1,7 @@
 import pytest
 
-from adrobot.editor import Offer, allocate, allocation_issue
+from adrobot.offer_shares import allocate, allocation_issue
+from adrobot.schema import Offer
 
 
 def offers(*ids):

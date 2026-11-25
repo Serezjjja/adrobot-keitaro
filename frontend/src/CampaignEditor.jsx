@@ -1,49 +1,8 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
 import { request } from './api.js'
+import { capturePublication, readPendingPublications, reconcilePublications, savePendingPublications } from './publications.js'
 import SelectionIcon from './SelectionIcon.jsx'
 import StreamCard from './StreamCard.jsx'
-
-function offerLinks(offers) {
-  return JSON.stringify(offers.filter((offer) => !offer.removed)
-    .map(({ id, share, enabled }) => [id, share, enabled]).sort(([left], [right]) => left - right))
-}
-
-export function readPendingPublications(campaignId) {
-  try {
-    const saved = JSON.parse(sessionStorage.getItem('adrobot:publications:' + campaignId) ?? '{}')
-    if (!saved || Array.isArray(saved) || typeof saved !== 'object') return {}
-    return Object.fromEntries(Object.entries(saved).filter(([id, pending]) => /^\d+$/.test(id)
-      && pending && typeof pending.links === 'string' && typeof pending.message === 'string'))
-  } catch {
-    return {}
-  }
-}
-
-export function savePendingPublications(campaignId, pending) {
-  try {
-    sessionStorage.setItem('adrobot:publications:' + campaignId, JSON.stringify(pending))
-  } catch {
-    // Browser storage can be unavailable; the server marker still protects known publications.
-  }
-}
-
-export function publicationResult(stream, pending) {
-  if (stream.publication_pending) return null
-  if (stream.missing) return { kind: 'reconciled', message: 'Сверка завершена. Поток отсутствует в Keitaro; черновик сохранён.' }
-  if (stream.conflict) return { kind: 'reconciled', message: 'Сверка завершена. Поток изменился в Keitaro; черновик сохранён.' }
-  const published = stream.dirty ? stream.published_offers : stream.offers
-  if (published && offerLinks(published) === pending.links) {
-    return stream.dirty
-      ? { kind: 'reconciled', message: 'Публикация подтверждена. В потоке уже есть новый черновик.' }
-      : { kind: 'published' }
-  }
-  return {
-    kind: 'reconciled',
-    message: stream.dirty
-      ? 'Ожидаемые изменения не подтверждены. Черновик сохранён.'
-      : 'Потоки обновлены. Ожидаемые изменения не найдены в Keitaro.',
-  }
-}
 
 export default function CampaignEditor({ campaign, created, onBusyChange }) {
   const [streams, setStreams] = useState(null)
@@ -107,23 +66,11 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
     }
   }, [onBusyChange])
 
-  const sync = useCallback(() => runOperation('sync', null, async () => {
+  const sync = useCallback((previousStreams) => runOperation('sync', null, async () => {
     try {
       const current = await request('/campaigns/' + campaign.id + '/sync', { method: 'POST' })
       setStreams(current)
-      const results = {}
-      const missing = []
-      const remaining = {}
-      const tracked = { ...pendingRef.current }
-      for (const stream of streams ?? []) {
-        if (stream.publication_pending && !tracked[stream.id]) tracked[stream.id] = { links: offerLinks(stream.offers), message: '' }
-      }
-      for (const [streamId, pending] of Object.entries(tracked)) {
-        const stream = current.find((item) => String(item.id) === streamId)
-        if (stream) results[streamId] = publicationResult(stream, pending)
-        else missing.push('#' + streamId)
-        if (stream?.publication_pending) remaining[streamId] = pending
-      }
+      const { results, missing, remaining } = reconcilePublications(previousStreams, current, pendingRef.current)
       setPublicationResults(results)
       updatePending(() => remaining)
       if (missing.length) {
@@ -136,12 +83,12 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
       setFeedback({ kind: 'sync-error', message: error.message })
       return false
     }
-  }), [campaign.id, streams, runOperation])
+  }), [campaign.id, runOperation])
 
   const syncOnFirstRead = useEffectEvent((current) => {
     if (initialRead.current) return
     initialRead.current = true
-    if (created || current.length === 0) void sync()
+    if (created || current.length === 0) void sync(current)
   })
 
   useEffect(() => {
@@ -172,9 +119,10 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
         if (kind === 'cancel') {
           updated = await request(path + '/draft?version=' + stream.version, { method: 'DELETE' })
         } else if (kind === 'publish') {
-          updatePending((current) => ({ ...current, [stream.id]: {
-            links: offerLinks(stream.offers), message: 'Запрос публикации отправлен. Результат требует сверки.',
-          } }))
+          updatePending((current) => ({
+            ...current,
+            [stream.id]: capturePublication(stream, 'Запрос публикации отправлен. Результат требует сверки.'),
+          }))
           updated = await request(path + '/publish', { method: 'POST', body: { version: stream.version } })
           clearPendingPublication(stream.id)
         } else {
@@ -190,9 +138,7 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
       } catch (error) {
         const uncertain = kind === 'publish' && error.uncertain
         if (uncertain) {
-          updatePending((current) => ({ ...current, [stream.id]: {
-            links: offerLinks(stream.offers), message: error.message,
-          } }))
+          updatePending((current) => ({ ...current, [stream.id]: capturePublication(stream, error.message) }))
         } else if (kind === 'publish') {
           clearPendingPublication(stream.id)
         }
@@ -221,7 +167,7 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
 
   async function cancelAndSync(stream) {
     if (!window.confirm('Отменить правки потока #' + stream.id + ' и загрузить его состояние из Keitaro?')) return
-    if (await action(stream, 'cancel')) await sync()
+    if (await action(stream, 'cancel')) await sync(streams)
   }
 
   const refreshing = operation?.kind === 'sync'
@@ -244,7 +190,7 @@ export default function CampaignEditor({ campaign, created, onBusyChange }) {
               Открыть в Keitaro <SelectionIcon kind="external" className="external-link-icon" />
             </a>
           )}
-          <button type="button" className="refresh-button progress-button" onClick={sync}
+          <button type="button" className="refresh-button progress-button" onClick={() => sync(streams)}
             disabled={loading || Boolean(operation)}>
             <span className="progress-size" aria-hidden="true">Обновить потоки из Keitaro</span>
             <span className="progress-label">

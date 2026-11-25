@@ -4,48 +4,9 @@ from sqlalchemy.orm import Session
 from adrobot.db import StreamDraft
 from adrobot.errors import AppError, KeitaroError
 from adrobot.keitaro import Keitaro
+from adrobot.offer_shares import allocate, allocation_issue, validate_pinned_shares
+from adrobot.offer_snapshots import archive_offer, merge_remote_offers, offer_links, same_links
 from adrobot.schema import DraftChange, Flow, FlowOffer, Offer, StreamView
-
-
-def allocate(offers: list[Offer]) -> list[Offer]:
-    active = [offer for offer in offers if offer.enabled and not offer.removed]
-    pinned = sum(offer.share for offer in active if offer.pinned)
-    free = [offer.id for offer in active if not offer.pinned]
-    if not free or pinned > 100:
-        return offers
-
-    share, remainder = divmod(100 - pinned, len(free))
-    # Give the extra percentage points to the first free offers in stable stream order.
-    shares = {offer_id: share + (index < remainder) for index, offer_id in enumerate(free)}
-    return [
-        offer.model_copy(update={"share": shares[offer.id]}) if offer.id in shares else offer
-        for offer in offers
-    ]
-
-
-def allocation_issue(offers: list[Offer]) -> str | None:
-    active = [offer for offer in offers if offer.enabled and not offer.removed]
-    if not active:
-        return "Для публикации нужен хотя бы один активный оффер."
-    if sum(offer.share for offer in active) != 100:
-        return "Сумма долей должна быть 100%. Снимите часть закреплений или добавьте оффер."
-    return None
-
-
-def _links(offers: list[Offer]) -> list[FlowOffer]:
-    return [
-        FlowOffer(
-            offer_id=offer.id, share=offer.share, state="active" if offer.enabled else "disabled"
-        )
-        for offer in offers
-        if not offer.removed
-    ]
-
-
-def _same_links(left: list[FlowOffer], right: list[FlowOffer]) -> bool:
-    return sorted(left, key=lambda link: link.offer_id) == sorted(
-        right, key=lambda link: link.offer_id
-    )
 
 
 def _load(items: list[dict]) -> list[Offer]:
@@ -54,10 +15,6 @@ def _load(items: list[dict]) -> list[Offer]:
 
 def _dump(items: list[Offer]) -> list[dict]:
     return [item.model_dump() for item in items]
-
-
-def _archive(offer: Offer) -> Offer:
-    return offer.model_copy(update={"share": 0, "pinned": False, "removed": True})
 
 
 def _stream_view(stream: StreamDraft) -> StreamView:
@@ -106,85 +63,119 @@ def attached_offer_ids(db: Session, stream_id: int) -> set[int]:
 
 def _import_flow(stream: StreamDraft, flow: Flow, names: dict[int, str]) -> None:
     stream.conflict = False
-    if not flow.editable:
-        # A redirect can become an offer flow again. Keep the prior archive for that case.
-        return
-
-    previous = {offer.id: offer for offer in _load(stream.published)}
-    received = {link.offer_id: link for link in flow.offers}
-    offers = []
-
-    # Preserve the known order so integer remainders don't move between offers on Fetch.
-    for offer_id in dict.fromkeys([*previous, *received]):
-        old = previous.get(offer_id)
-        link = received.get(offer_id)
-        if link is None:
-            offers.append(_archive(old))
-            continue
-        offers.append(
-            Offer(
-                id=offer_id,
-                name=names.get(offer_id, old.name if old else f"Оффер #{offer_id}"),
-                share=link.share,
-                enabled=link.state == "active",
-                pinned=bool(
-                    old and old.pinned and old.share == link.share and link.state == "active"
-                ),
-            )
-        )
-
-    # Keep the tracker's actual shares on Fetch, even when they sum to less than 100.
-    stream.published = _dump(offers)
+    # После смены маршрутизации на офферы прежний архив снова пригодится.
+    if flow.editable:
+        stream.published = _dump(merge_remote_offers(_load(stream.published), flow.offers, names))
 
 
-def _corroborate_pending_flow(
+def _present_flow(flow: Flow | None, campaign_id: int) -> bool:
+    return bool(flow and flow.state != "deleted" and flow.campaign_id == campaign_id)
+
+
+def _same_remote_flow(left: Flow | None, right: Flow | None, campaign_id: int) -> bool:
+    if not _present_flow(left, campaign_id) and not _present_flow(right, campaign_id):
+        return True
+    return bool(
+        _present_flow(left, campaign_id)
+        and _present_flow(right, campaign_id)
+        and left.routing == right.routing
+        and left.state == right.state
+        and same_links(left.offers, right.offers)
+    )
+
+
+def _require_flow_routing(flow: Flow | None) -> None:
+    # Пропущенная schema не доказывает переход на другой тип маршрутизации.
+    if (
+        flow
+        and flow.state != "deleted"
+        and ("routing" not in flow.model_fields_set or not flow.routing.strip())
+    ):
+        raise AppError(502, "Keitaro не вернул тип потока. Загрузите потоки снова.")
+
+
+def _read_corroborating_flow(
     tracker: Keitaro, stream: StreamDraft, listed: Flow | None
 ) -> Flow | None:
-    desired = _links(_load(stream.draft))
-
-    def present(flow: Flow | None) -> bool:
-        return bool(flow and flow.state != "deleted" and flow.campaign_id == stream.campaign_id)
-
-    def confirms(flow: Flow | None) -> bool:
-        return bool(present(flow) and flow.editable and _same_links(flow.offers, desired))
-
-    # A matching draft confirms the write. Otherwise require agreement before unlocking edits.
-    if confirms(listed):
-        return listed
     try:
         detail = tracker.stream(stream.id)
     except KeitaroError as exc:
         if exc.upstream_status != 404:
             raise
         detail = None
-    if confirms(detail):
-        return detail
-    if not present(listed) and not present(detail):
-        return None
+    _require_flow_routing(listed)
+    _require_flow_routing(detail)
+    return detail
+
+
+def _corroborate_pending_flow(
+    tracker: Keitaro, stream: StreamDraft, listed: Flow | None
+) -> Flow | None:
+    desired = offer_links(_load(stream.draft))
+    published = offer_links(_load(stream.published))
+    # Даже совпавший с черновиком список может запаздывать: проверяем карточку перед снятием блокировки.
+    detail = _read_corroborating_flow(tracker, stream, listed)
+    listed_can_lag = listed is None or (
+        _present_flow(listed, stream.campaign_id)
+        and listed.editable
+        and (same_links(listed.offers, published) or same_links(listed.offers, desired))
+    )
     if (
-        present(listed)
-        and present(detail)
-        and listed.routing == detail.routing
-        and listed.state == detail.state
-        and _same_links(listed.offers, detail.offers)
+        listed_can_lag
+        and _present_flow(detail, stream.campaign_id)
+        and detail.editable
+        and same_links(detail.offers, desired)
     ):
         return detail
+    if _same_remote_flow(listed, detail, stream.campaign_id):
+        return detail if _present_flow(detail, stream.campaign_id) else None
     raise AppError(
         502, "Keitaro вернул несогласованные данные. Черновик сохранён. Загрузите потоки снова."
     )
 
 
+def _corroborate_clean_flow(
+    tracker: Keitaro, stream: StreamDraft, listed: Flow | None, campaign_id: int
+) -> None:
+    if stream.missing and not _present_flow(listed, campaign_id):
+        return
+    if (
+        not stream.missing
+        and stream.campaign_id == campaign_id
+        and _present_flow(listed, campaign_id)
+        and "routing" in listed.model_fields_set
+        and listed.editable == stream.editable
+        and (not listed.editable or same_links(listed.offers, offer_links(_load(stream.published))))
+    ):
+        return
+    # Перед заменой чистого снимка сверяем изменения, чтобы старый список не сбросил закрепления.
+    detail = _read_corroborating_flow(tracker, stream, listed)
+    if not _same_remote_flow(listed, detail, campaign_id):
+        raise AppError(502, "Keitaro вернул несогласованные данные. Загрузите потоки снова.")
+
+
 def synchronize(db: Session, tracker: Keitaro, campaign_id: int) -> list[StreamView]:
-    flows = {flow.id: flow for flow in tracker.streams(campaign_id) if flow.state != "deleted"}
+    listed = {flow.id: flow for flow in tracker.streams(campaign_id)}
+    for flow in listed.values():
+        _require_flow_routing(flow)
+    flows = {flow_id: flow for flow_id, flow in listed.items() if flow.state != "deleted"}
     existing = {stream.id: stream for stream in _campaign_rows(db, campaign_id)}
-    # Corroborate before changing any rows: one stale endpoint must not unlock a PUT.
+    # Один запоздавший ответ не должен снять блокировку. Сверяем публикации до изменений в SQLite.
     for stream in existing.values():
         if stream.publication_pending and stream.draft is not None:
-            confirmed = _corroborate_pending_flow(tracker, stream, flows.get(stream.id))
+            confirmed = _corroborate_pending_flow(tracker, stream, listed.get(stream.id))
             if confirmed is None:
                 flows.pop(stream.id, None)
             else:
                 flows[stream.id] = confirmed
+        elif stream.draft is None:
+            _corroborate_clean_flow(tracker, stream, listed.get(stream.id), campaign_id)
+    # Перенос чистого потока тоже меняет снимок: проверяем его до принятия в новую кампанию.
+    for flow in flows.values():
+        if flow.id not in existing:
+            stream = db.get(StreamDraft, flow.id)
+            if stream is not None and stream.draft is None:
+                _corroborate_clean_flow(tracker, stream, flow, campaign_id)
     names = (
         {offer.id: offer.name for offer in tracker.offers()}
         if any(flow.editable and flow.offers for flow in flows.values())
@@ -228,14 +219,14 @@ def synchronize(db: Session, tracker: Keitaro, campaign_id: int) -> list[StreamV
 
 
 def _reconcile_draft(stream: StreamDraft, flow: Flow) -> None:
-    published = _links(_load(stream.published))
-    changed_remotely = not _same_links(flow.offers, published)
+    published = offer_links(_load(stream.published))
+    changed_remotely = not same_links(flow.offers, published)
     if (
         stream.publication_pending
         and flow.editable
-        and _same_links(flow.offers, _links(_load(stream.draft)))
+        and same_links(flow.offers, offer_links(_load(stream.draft)))
     ):
-        # A previous PUT may have succeeded even when its response never reached us.
+        # Keitaro мог применить предыдущий PUT даже при потере ответа.
         stream.published = stream.draft
         stream.draft = None
         stream.conflict = False
@@ -292,7 +283,7 @@ def change_draft(db: Session, tracker: Keitaro, stream_id: int, change: DraftCha
         raise AppError(404, "Оффер отсутствует в потоке.")
     elif action == "remove":
         if any(saved.id == offer.id for saved in published):
-            offers[offer.id] = _archive(offer)
+            offers[offer.id] = archive_offer(offer)
         else:
             del offers[offer.id]
     elif action in {"pin", "unpin"} and offer.enabled:
@@ -302,18 +293,9 @@ def change_draft(db: Session, tracker: Keitaro, stream_id: int, change: DraftCha
     else:
         raise AppError(422, "Это действие недоступно для выбранного оффера.")
 
-    if action in {"pin", "set_share"}:
-        active = [item for item in offers.values() if item.enabled and not item.removed]
-        pinned_total = sum(item.share for item in active if item.pinned)
-        if pinned_total > 100:
-            raise AppError(422, "Сумма закреплённых долей больше 100%. Уменьшите долю.")
-        if action == "set_share" and pinned_total < 100 and all(item.pinned for item in active):
-            raise AppError(
-                422,
-                "Сумма закреплённых долей должна быть 100%. Снимите закрепление или измените долю.",
-            )
-
     result = list(offers.values())
+    if action in {"pin", "set_share"}:
+        validate_pinned_shares(result, require_full=action == "set_share")
     if action in {"pin", "unpin"} and stream.draft is None:
         stream.published = _dump(result)
         return _save(db, stream)
@@ -340,6 +322,7 @@ def _current_offer_flow(
             raise
         flow = None
 
+    _require_flow_routing(flow)
     if publication_readback and (
         flow is None
         or flow.state == "deleted"
@@ -376,16 +359,19 @@ def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -
     if issue:
         raise AppError(422, issue)
 
-    desired = _links(draft)
+    desired = offer_links(draft)
     current = _current_offer_flow(db, tracker, stream)
 
-    if not _same_links(current.offers, _links(_load(stream.published))):
+    if not same_links(current.offers, offer_links(_load(stream.published))):
         stream.conflict = True
         _save(db, stream)
         raise AppError(409, "Офферы изменились в Keitaro. Черновик сохранён.")
 
-    if not _same_links(current.offers, desired):
-        available = {offer.id for offer in tracker.offers() if offer.available}
+    if not same_links(current.offers, desired):
+        required = {
+            offer.id for offer in draft if offer.enabled and not offer.removed and offer.share > 0
+        }
+        available = tracker.active_offer_ids(required)
         unavailable = [
             offer
             for offer in draft
@@ -394,8 +380,7 @@ def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -
         if unavailable:
             labels = ", ".join(f"{offer.name} (#{offer.id})" for offer in unavailable)
             raise AppError(422, f"Офферы недоступны в Keitaro: {labels}. Черновик сохранён.")
-        # Commit before the remote write: a lost response or process restart must not
-        # unlock Cancel or a second publication before an authoritative Fetch.
+        # Фиксируем попытку до PUT, чтобы потеря ответа или перезапуск сохраняли блокировку до Fetch.
         stream.publication_pending = True
         _save(db, stream)
         try:
@@ -405,20 +390,25 @@ def publish_draft(db: Session, tracker: Keitaro, stream_id: int, version: int) -
                 stream.publication_pending = False
                 _save(db, stream)
                 raise
-        try:
-            confirmed = _current_offer_flow(db, tracker, stream, publication_readback=True)
-        except KeitaroError as exc:
-            raise AppError(
-                502, "Публикация не подтверждена. Черновик сохранён. Загрузите потоки снова."
-            ) from exc
-        if not _same_links(confirmed.offers, desired):
-            # Even an accepted PUT can be followed by a stale immediate read.
-            # Only explicit Fetch may unlock a publication that was not confirmed.
-            raise AppError(
-                502, "Keitaro не подтвердил новые доли. Черновик сохранён. Загрузите потоки снова."
-            )
+        _confirm_publication(db, tracker, stream, desired)
 
     stream.publication_pending = False
     stream.published = stream.draft
     stream.draft = None
     return _save(db, stream)
+
+
+def _confirm_publication(
+    db: Session, tracker: Keitaro, stream: StreamDraft, desired: list[FlowOffer]
+) -> None:
+    try:
+        confirmed = _current_offer_flow(db, tracker, stream, publication_readback=True)
+    except KeitaroError as exc:
+        raise AppError(
+            502, "Публикация не подтверждена. Черновик сохранён. Загрузите потоки снова."
+        ) from exc
+    if not same_links(confirmed.offers, desired):
+        # Keitaro может вернуть старые доли сразу после PUT. Блокировка остаётся до Fetch.
+        raise AppError(
+            502, "Keitaro не подтвердил новые доли. Черновик сохранён. Загрузите потоки снова."
+        )

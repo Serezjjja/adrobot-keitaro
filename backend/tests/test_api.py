@@ -322,6 +322,82 @@ def test_fetch_of_moved_stream_preserves_archive_and_requires_cancel_in_old_camp
     assert client.get("/api/campaigns/8/streams").json() == [moved]
 
 
+@pytest.mark.parametrize("detail", ["current", "wrong_campaign"])
+def test_fetch_moved_clean_stream_corroborates_before_adopting_stale_list(
+    client, fake, monkeypatch, detail
+):
+    import httpx
+
+    _, stream = sync(client)
+    base = deepcopy(fake.streams[102])
+    published = publish(client, set_share(client, stream, 11, 40).json()).json()
+    before = client.get("/api/campaigns/7/streams").json()
+    fake.campaigns[8] = {**fake.campaigns[7], "id": 8}
+    fake.streams[102]["campaign_id"] = 8
+    original_get = fake._get
+
+    def stale_moved_list(request, path):
+        if path == "campaigns/8/streams":
+            return httpx.Response(200, json=[{**base, "campaign_id": 8}])
+        if path == "streams/102" and detail == "wrong_campaign":
+            return httpx.Response(200, json={**fake.streams[102], "campaign_id": 7})
+        return original_get(request, path)
+
+    monkeypatch.setattr(fake, "_get", stale_moved_list)
+    assert client.post("/api/campaigns/8/sync").status_code == 502
+    assert client.get("/api/campaigns/7/streams").json() == before
+    assert client.get("/api/campaigns/8/streams").json() == []
+    monkeypatch.setattr(fake, "_get", original_get)
+    [moved] = sync(client, 8)
+    assert moved["offers"] == published["offers"]
+    assert moved["offers"][0]["pinned"]
+
+
+@pytest.mark.parametrize("local", ["new", "clean", "dirty"])
+def test_fetch_missing_routing_preserves_local_state(client, fake, local):
+    if local != "new":
+        _, stream = sync(client)
+        if local == "dirty":
+            change(client, stream, "add", 14)
+    before = client.get("/api/campaigns/7/streams").json()
+    del fake.streams[102]["schema"]
+    assert client.post("/api/campaigns/7/sync").status_code == 502
+    assert client.get("/api/campaigns/7/streams").json() == before
+
+
+def test_publish_missing_routing_preserves_draft_before_put(client, fake):
+    _, stream = sync(client)
+    draft = change(client, stream, "add", 14)
+    del fake.streams[102]["schema"]
+    assert publish(client, draft).status_code == 502
+    assert client.get("/api/campaigns/7/streams").json()[1] == draft
+    assert not any(method == "PUT" for method, _, _ in fake.calls)
+
+
+def test_fetch_does_not_recheck_confirmed_missing_clean_stream(client, fake, monkeypatch):
+    import httpx
+
+    sync(client)
+    removed = fake.streams.pop(102)
+    assert [row["id"] for row in sync(client)] == [101]
+    original_get = fake._get
+
+    def forbidden_old_stream(request, path):
+        if path == "streams/102":
+            return httpx.Response(403, json={"error": "forbidden"})
+        return original_get(request, path)
+
+    monkeypatch.setattr(fake, "_get", forbidden_old_stream)
+    before_calls = len(fake.calls)
+    assert [row["id"] for row in sync(client)] == [101]
+    assert not any(path == "streams/102" for _, path, _ in fake.calls[before_calls:])
+    fake.streams[102] = removed
+    assert client.post("/api/campaigns/7/sync").status_code == 503
+    assert [row["id"] for row in client.get("/api/campaigns/7/streams").json()] == [101]
+    monkeypatch.setattr(fake, "_get", original_get)
+    assert sync(client)[1]["id"] == 102
+
+
 def test_schema_change_hides_offers_temporarily_and_preserves_archive(client, fake):
     _, stream = sync(client)
     assert publish(client, change(client, stream, "remove", 12)).status_code == 200
@@ -670,6 +746,235 @@ def test_pending_fetch_uses_confirming_detail_when_campaign_list_is_stale(
     assert not confirmed["dirty"] and not confirmed["publication_pending"]
     assert confirmed["offers"] == draft["offers"]
     assert confirmed["offers"][0]["pinned"]
+
+
+@pytest.mark.parametrize("listed", ["different", "redirect", "deleted", "no_routing"])
+def test_pending_fetch_rejects_explicit_list_conflict_with_confirming_detail(
+    client, fake, monkeypatch, listed
+):
+    import httpx
+
+    _, stream = sync(client)
+    base = deepcopy(fake.streams[102])
+    draft = set_share(client, stream, 11, 40).json()
+    original_get = fake._get
+    detail_reads = []
+
+    def inconsistent_reads(request, path):
+        if any(method == "PUT" for method, _, _ in fake.calls):
+            if path == "streams/102":
+                detail_reads.append(True)
+                if len(detail_reads) == 1:
+                    return httpx.Response(200, json=base)
+            if path == "campaigns/7/streams":
+                value = deepcopy(fake.streams[102])
+                if listed == "different":
+                    value["offers"] = [link(11, 100)]
+                elif listed == "redirect":
+                    value["schema"] = "redirect"
+                elif listed == "deleted":
+                    value["state"] = "deleted"
+                else:
+                    del value["schema"]
+                return httpx.Response(200, json=[fake.streams[101], value])
+        return original_get(request, path)
+
+    fake.timeout_after_put = True
+    monkeypatch.setattr(fake, "_get", inconsistent_reads)
+    assert publish(client, draft).status_code == 502
+    pending = client.get("/api/campaigns/7/streams").json()[1]
+    assert client.post("/api/campaigns/7/sync").status_code == 502
+    assert client.get("/api/campaigns/7/streams").json()[1] == pending
+    monkeypatch.setattr(fake, "_get", original_get)
+    _, confirmed = sync(client)
+    assert not confirmed["dirty"] and not confirmed["publication_pending"]
+    assert confirmed["offers"] == draft["offers"]
+
+
+def test_pending_fetch_rejects_agreed_records_without_routing(client, fake, monkeypatch):
+    import httpx
+
+    _, stream = sync(client)
+    draft = set_share(client, stream, 11, 40).json()
+    original_get = fake._get
+
+    def incomplete_reads(request, path):
+        if any(method == "PUT" for method, _, _ in fake.calls):
+            value = deepcopy(fake.streams[102])
+            del value["schema"]
+            if path == "streams/102":
+                return httpx.Response(200, json=value)
+            if path == "campaigns/7/streams":
+                return httpx.Response(200, json=[fake.streams[101], value])
+        return original_get(request, path)
+
+    fake.timeout_after_put = True
+    monkeypatch.setattr(fake, "_get", incomplete_reads)
+    assert publish(client, draft).status_code == 502
+    pending = client.get("/api/campaigns/7/streams").json()[1]
+    assert client.post("/api/campaigns/7/sync").status_code == 502
+    assert client.get("/api/campaigns/7/streams").json()[1] == pending
+
+
+@pytest.mark.parametrize("routing", ["", "   "])
+def test_pending_fetch_rejects_blank_routing_after_gateway_timeout(
+    settings, fake, monkeypatch, routing
+):
+    import httpx
+
+    original_get = fake._get
+    base = deepcopy(fake.streams[102])
+    base["schema"] = routing
+
+    def blank_routing_reads(request, path):
+        if any(method == "PUT" for method, _, _ in fake.calls):
+            if path == "streams/102":
+                return httpx.Response(200, json=base)
+            if path == "campaigns/7/streams":
+                return httpx.Response(200, json=[fake.streams[101], base])
+        return original_get(request, path)
+
+    def gateway_timeout(request):
+        response = fake(request)
+        if request.method == "PUT":
+            return httpx.Response(504, json={"error": "gateway timeout"})
+        return response
+
+    monkeypatch.setattr(fake, "_get", blank_routing_reads)
+    with TestClient(create_app(settings, MockTransport(gateway_timeout))) as api:
+        _, stream = sync(api)
+        draft = set_share(api, stream, 11, 40).json()
+        assert publish(api, draft).status_code == 502
+        pending = api.get("/api/campaigns/7/streams").json()[1]
+        assert pending["publication_pending"] and pending["dirty"]
+        assert api.post("/api/campaigns/7/sync").status_code == 502
+        assert api.get("/api/campaigns/7/streams").json()[1] == pending
+        assert (
+            api.delete("/api/streams/102/draft", params={"version": pending["version"]}).status_code
+            == 409
+        )
+
+
+@pytest.mark.parametrize("listed", ["base", "redirect", "missing", "deleted"])
+def test_clean_fetch_preserves_published_pins_when_list_disagrees_with_detail(
+    client, fake, monkeypatch, listed
+):
+    import httpx
+
+    _, stream = sync(client)
+    base = deepcopy(fake.streams[102])
+    draft = set_share(client, stream, 11, 40).json()
+    published = publish(client, draft).json()
+    assert not published["dirty"] and published["offers"][0]["pinned"]
+    original_get = fake._get
+
+    def stale_list(request, path):
+        if path == "campaigns/7/streams":
+            value = deepcopy(base)
+            if listed == "redirect":
+                value["schema"] = "redirect"
+            elif listed == "deleted":
+                value["state"] = "deleted"
+            rows = [fake.streams[101]] + ([] if listed == "missing" else [value])
+            return httpx.Response(200, json=rows)
+        return original_get(request, path)
+
+    monkeypatch.setattr(fake, "_get", stale_list)
+    assert client.post("/api/campaigns/7/sync").status_code == 502
+    assert client.get("/api/campaigns/7/streams").json()[1] == published
+    monkeypatch.setattr(fake, "_get", original_get)
+    assert sync(client)[1] == published
+
+
+@pytest.mark.parametrize("catalog", ["stateless", "contradictory"])
+def test_publish_rejects_ambiguous_catalog_with_unavailable_detail(
+    client, fake, monkeypatch, catalog
+):
+    import httpx
+
+    _, stream = sync(client)
+    draft = change(client, stream, "add", 14)
+    original_get = fake._get
+
+    def ambiguous_offers(request, path):
+        if path == "offers":
+            rows = [deepcopy(offer) for offer in fake.offers if offer["id"] != 14]
+            if catalog == "stateless":
+                rows.append({"id": 14, "name": "Horizon"})
+            else:
+                rows.extend(
+                    [
+                        {"id": 14, "name": "Horizon", "state": "active"},
+                        {"id": 14, "name": "Horizon", "state": "disabled"},
+                    ]
+                )
+            return httpx.Response(200, json=rows)
+        if path == "offers/14":
+            return httpx.Response(200, json={"id": 14, "name": "Horizon", "state": "disabled"})
+        return original_get(request, path)
+
+    monkeypatch.setattr(fake, "_get", ambiguous_offers)
+    response = publish(client, draft)
+    assert response.status_code == 422
+    assert "Horizon (#14)" in response.json()["detail"]
+    assert not any(method == "PUT" for method, _, _ in fake.calls)
+    assert client.get("/api/campaigns/7/streams").json()[1] == draft
+
+
+@pytest.mark.parametrize("failure", ["timeout", "gateway"])
+@pytest.mark.parametrize("detail", ["different", "missing", "redirect", "moved"])
+def test_pending_fetch_requires_detail_even_when_list_matches_draft(
+    settings, fake, monkeypatch, failure, detail
+):
+    import httpx
+
+    original_get = fake._get
+
+    def conflicting_detail(request, path):
+        if path == "streams/102" and any(method == "PUT" for method, _, _ in fake.calls):
+            if detail == "missing":
+                return httpx.Response(404, json={"error": "missing"})
+            value = deepcopy(fake.streams[102])
+            if detail == "different":
+                value["offers"] = [link(11, 100)]
+            elif detail == "redirect":
+                value["schema"] = "redirect"
+            else:
+                value["campaign_id"] = 8
+            return httpx.Response(200, json=value)
+        return original_get(request, path)
+
+    def transport(request):
+        response = fake(request)
+        if request.method == "PUT" and failure == "gateway":
+            return httpx.Response(504, json={"error": "gateway timeout"})
+        return response
+
+    fake.timeout_after_put = failure == "timeout"
+    monkeypatch.setattr(fake, "_get", conflicting_detail)
+    with TestClient(create_app(settings, MockTransport(transport))) as api:
+        _, stream = sync(api)
+        draft = set_share(api, stream, 11, 40).json()
+        assert publish(api, draft).status_code == 502
+        assert fake.streams[102]["offers"] == [link(11, 40), link(12, 30), link(13, 30)]
+        pending = api.get("/api/campaigns/7/streams").json()[1]
+        assert pending["publication_pending"] and pending["dirty"]
+        assert pending["offers"] == draft["offers"]
+
+        assert api.post("/api/campaigns/7/sync").status_code == 502
+        assert api.get("/api/campaigns/7/streams").json()[1] == pending
+        assert set_share(api, pending, 11, 50).status_code == 409
+        assert publish(api, pending).status_code == 409
+        assert (
+            api.delete("/api/streams/102/draft", params={"version": pending["version"]}).status_code
+            == 409
+        )
+
+        monkeypatch.setattr(fake, "_get", original_get)
+        _, confirmed = sync(api)
+        assert not confirmed["dirty"] and not confirmed["publication_pending"]
+        assert confirmed["offers"] == draft["offers"]
+        assert sum(method == "PUT" for method, _, _ in fake.calls) == 1
 
 
 @pytest.mark.parametrize("detail", ["different", "missing", "redirect", "moved"])

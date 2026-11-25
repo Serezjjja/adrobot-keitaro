@@ -47,6 +47,7 @@ class Flow(Resource):
     state: str = "active"
     action_type: str | None = None
     action_payload: str | dict[str, Any] | None = None
+    collect_clicks: bool | None = None
     filter_or: bool = False
     filters: list[dict[str, Any]] = Field(default_factory=list)
     offers: list[FlowOffer] = Field(default_factory=list)

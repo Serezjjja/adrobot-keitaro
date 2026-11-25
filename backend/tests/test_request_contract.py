@@ -3,8 +3,150 @@ import pytest
 from fastapi.testclient import TestClient
 
 from adrobot.config import Settings
+from adrobot.errors import AppError, KeitaroError
+from adrobot.keitaro import Keitaro
 from adrobot.main import create_app
 from tests.fakes import link
+
+
+@pytest.mark.parametrize(
+    "states, expected",
+    [
+        (["active"], True),
+        (["active", None], True),
+        (["active", "disabled"], False),
+        (["active", "deleted"], False),
+        ([None], False),
+        ([], False),
+    ],
+)
+def test_stateless_offer_detail_requires_active_catalog_without_explicit_conflict(states, expected):
+    def transport(request):
+        if request.url.path == "/offers":
+            return httpx.Response(
+                200, json=[{"id": 11, "name": "Northstar", "state": state} for state in states]
+            )
+        return httpx.Response(200, json={"id": 11, "name": "Northstar"})
+
+    with httpx.Client(
+        base_url="https://tracker.example",
+        headers={"Api-Key": "fake-key"},
+        transport=httpx.MockTransport(transport),
+    ) as http:
+        if expected:
+            assert Keitaro(http).active_offer(11).id == 11
+        else:
+            with pytest.raises(AppError) as error:
+                Keitaro(http).active_offer(11)
+            assert error.value.status == 422
+
+
+def test_batch_offer_availability_limits_results_to_requested_ids_and_skips_empty_input():
+    calls = []
+
+    def transport(request):
+        calls.append(request.url.path)
+        return httpx.Response(
+            200,
+            json=[
+                {"id": offer_id, "name": str(offer_id), "state": "active"} for offer_id in [11, 12]
+            ],
+        )
+
+    with httpx.Client(
+        base_url="https://tracker.example",
+        headers={"Api-Key": "fake-key"},
+        transport=httpx.MockTransport(transport),
+    ) as http:
+        tracker = Keitaro(http)
+        assert tracker.active_offer_ids(set()) == set()
+        assert not calls
+        assert tracker.active_offer_ids({11}) == {11}
+        assert calls == ["/offers"]
+
+
+@pytest.mark.parametrize("detail_state", [{}, {"state": None}])
+@pytest.mark.parametrize("catalog_state", ["disabled", None])
+def test_create_rejects_offer_without_confirmed_active_state(
+    settings, fake, detail_state, catalog_state
+):
+    fake.offers[0]["state"] = catalog_state
+
+    def transport(request):
+        if request.url.path.endswith("/offers/11"):
+            return httpx.Response(200, json={"id": 11, "name": "Northstar", **detail_state})
+        return fake(request)
+
+    payload = {
+        "name": "test_demo_offer_state",
+        "country": "CA",
+        "offer_id": 11,
+        "domain_id": 1,
+        "group_id": 2,
+        "traffic_source_id": 3,
+    }
+    with TestClient(create_app(settings, httpx.MockTransport(transport))) as client:
+        response = client.post("/api/campaigns", json=payload)
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"] == "Оффер #11 недоступен в Keitaro."
+        assert not any(method == "POST" for method, _, _ in fake.calls)
+
+
+@pytest.mark.parametrize(
+    "states, detail_state, expected, detail_requested",
+    [
+        (["active"], "disabled", {11}, False),
+        (["active", "disabled"], "active", set(), False),
+        (["disabled"], "active", set(), False),
+        ([None], "active", {11}, True),
+        (["active", None], "active", {11}, True),
+        (["active", None], None, set(), True),
+        ([None], None, set(), True),
+        ([None], "disabled", set(), True),
+        ([], "active", set(), False),
+    ],
+)
+def test_batch_offer_availability_requires_uncontradicted_active_state(
+    states, detail_state, expected, detail_requested
+):
+    paths = []
+
+    def transport(request):
+        paths.append(request.url.path)
+        if request.url.path == "/offers":
+            return httpx.Response(
+                200, json=[{"id": 11, "name": "Northstar", "state": state} for state in states]
+            )
+        assert request.url.path == "/offers/11"
+        return httpx.Response(200, json={"id": 11, "name": "Northstar", "state": detail_state})
+
+    with httpx.Client(
+        base_url="https://tracker.example",
+        headers={"Api-Key": "fake-key"},
+        transport=httpx.MockTransport(transport),
+    ) as http:
+        assert Keitaro(http).active_offer_ids({11}) == expected
+    assert ("/offers/11" in paths) == detail_requested
+
+
+@pytest.mark.parametrize("status", [404, 403, 503])
+def test_batch_offer_availability_handles_detail_failures(status):
+    def transport(request):
+        if request.url.path == "/offers":
+            return httpx.Response(200, json=[{"id": 11, "name": "Northstar"}])
+        return httpx.Response(status, json={"error": "unavailable"})
+
+    with httpx.Client(
+        base_url="https://tracker.example",
+        headers={"Api-Key": "fake-key"},
+        transport=httpx.MockTransport(transport),
+    ) as http:
+        if status == 404:
+            assert Keitaro(http).active_offer_ids({11}) == set()
+        else:
+            with pytest.raises(KeitaroError) as error:
+                Keitaro(http).active_offer_ids({11})
+            assert error.value.upstream_status == status
 
 
 def test_tracker_api_uses_clean_base_path(settings):

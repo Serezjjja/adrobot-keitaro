@@ -35,6 +35,9 @@ def test_creation_confirms_two_flows_and_reuses_same_campaign(client, fake):
     )
     assert fallback["offers"] == [link(11, 100)]
     assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 1
+    assert not any(
+        method == "GET" and path.startswith("streams/") for method, path, _ in fake.calls
+    )
 
 
 def test_creation_requires_a_name_after_a_compound_prefix(client, fake):
@@ -590,3 +593,270 @@ def test_migrated_known_campaign_requires_both_flows_before_resuming(
         method == "POST" and path == "streams" for method, path, _ in fake.calls[before:]
     )
     assert fake.campaigns[8]["state"] == "active"
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected_status"),
+    [
+        ("landing", 409),
+        ("missing", 409),
+        ("wrong_campaign", 409),
+        ("wrong_id", 502),
+        ("empty", 201),
+    ],
+)
+def test_creation_checks_detail_when_fallback_list_omits_landings(
+    client, fake, monkeypatch, detail, expected_status
+):
+    get = fake._get
+
+    def incomplete_stream_list(request, path):
+        response = get(request, path)
+        if path == "campaigns/8/streams":
+            flows = response.json()
+            for flow in flows:
+                if flow["position"] == 2:
+                    flow.pop("landings", None)
+            return httpx.Response(200, json=flows)
+        if path.startswith("streams/") and response.status_code == 200:
+            flow = response.json()
+            if flow["campaign_id"] == 8 and flow["position"] == 2:
+                if detail == "landing":
+                    flow["landings"] = [{"landing_id": 42, "share": 100}]
+                elif detail == "missing":
+                    flow.pop("landings", None)
+                elif detail == "wrong_campaign":
+                    flow["campaign_id"] = 7
+                elif detail == "wrong_id":
+                    flow["id"] += 1
+                return httpx.Response(200, json=flow)
+        return response
+
+    monkeypatch.setattr(fake, "_get", incomplete_stream_list)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == expected_status, response.text
+    fallback = next(
+        flow for flow in fake.streams.values() if flow["campaign_id"] == 8 and flow["position"] == 2
+    )
+    assert any(path == f"streams/{fallback['id']}" for _, path, _ in fake.calls)
+    assert fake.campaigns[8]["state"] == ("active" if detail == "empty" else "disabled")
+    assert any(path.endswith("/enable") for _, path, _ in fake.calls) == (detail == "empty")
+
+
+@pytest.mark.parametrize("readback", ["wrong_id", "wrong_alias", "unavailable"])
+def test_creation_saves_id_only_after_canonical_ownership_check_and_recovers_by_alias(
+    client, fake, monkeypatch, readback
+):
+    from sqlalchemy import select
+
+    from adrobot.db import CampaignCreation
+
+    tracker = client.app.state.tracker
+    create = tracker.create_campaign
+    get = fake._get
+    failing = True
+
+    def incorrect_post_id(settings):
+        created = create(settings)
+        return created.model_copy(update={"id": 7}) if readback == "wrong_id" else created
+
+    def unconfirmed_detail(request, path):
+        response = get(request, path)
+        if failing and path == "campaigns/8":
+            if readback == "unavailable":
+                return httpx.Response(503, json={"error": "temporary"})
+            if readback == "wrong_alias":
+                return httpx.Response(
+                    200, json={**response.json(), "alias": "another-installation"}
+                )
+        return response
+
+    monkeypatch.setattr(tracker, "create_campaign", incorrect_post_id)
+    monkeypatch.setattr(fake, "_get", unconfirmed_detail)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == (502 if readback == "unavailable" else 409)
+    with client.app.state.sessions() as db:
+        operation = db.scalar(select(CampaignCreation))
+        assert operation.campaign_id is None
+        assert operation.remote_alias == fake.campaigns[8]["alias"]
+    assert not any(method == "POST" and path == "streams" for method, path, _ in fake.calls)
+    assert fake.campaigns[8]["state"] == "disabled"
+
+    failing = False
+    retry = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["id"] == 8
+    assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 1
+    assert fake.campaigns[7]["state"] == "active"
+    assert fake.campaigns[8]["state"] == "active"
+
+
+@pytest.mark.parametrize("mismatch", ["offer", "state", "filters", "action_type"])
+def test_creation_rejects_list_mismatch_despite_matching_stale_stream_detail(
+    client, fake, monkeypatch, mismatch
+):
+    get = fake._get
+
+    def contradictory_list(request, path):
+        response = get(request, path)
+        if path == "campaigns/8/streams":
+            flows = response.json()
+            for flow in flows:
+                if flow["position"] == 2:
+                    flow.pop("landings", None)
+                    if mismatch == "offer":
+                        flow["offers"] = [link(14, 100)]
+                    elif mismatch == "state":
+                        flow["state"] = "disabled"
+                    elif mismatch == "filters":
+                        flow["filters"] = [{"name": "country", "mode": "accept", "payload": ["US"]}]
+                    elif mismatch == "action_type":
+                        flow["action_type"] = "iframe"
+            return httpx.Response(200, json=flows)
+        return response
+
+    monkeypatch.setattr(fake, "_get", contradictory_list)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == 409, response.text
+    assert fake.campaigns[8]["state"] == "disabled"
+    assert not any(path.endswith("/enable") for _, path, _ in fake.calls)
+
+
+@pytest.mark.parametrize(
+    ("position", "field"), [(1, "type"), (1, "filters"), (2, "type"), (2, "filters")]
+)
+@pytest.mark.parametrize("detail", ["matching", "mismatch", "missing"])
+def test_creation_confirms_omitted_routing_fields_in_stream_detail(
+    client, fake, monkeypatch, position, field, detail
+):
+    get = fake._get
+
+    def incomplete_list(request, path):
+        response = get(request, path)
+        if path == "campaigns/8/streams":
+            flows = response.json()
+            for flow in flows:
+                if flow["position"] == position:
+                    flow.pop(field, None)
+            return httpx.Response(200, json=flows)
+        if path.startswith("streams/") and response.status_code == 200:
+            flow = response.json()
+            if flow["campaign_id"] == 8 and flow["position"] == position:
+                flow.pop("filter_or", None)
+                if detail == "missing":
+                    flow.pop(field, None)
+                elif detail == "mismatch":
+                    flow[field] = (
+                        ("default" if position == 1 else "regular")
+                        if field == "type"
+                        else [{"name": "country", "mode": "accept", "payload": ["AU"]}]
+                    )
+                return httpx.Response(200, json=flow)
+        return response
+
+    monkeypatch.setattr(fake, "_get", incomplete_list)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == (201 if detail == "matching" else 409), response.text
+    flow = next(
+        flow
+        for flow in fake.streams.values()
+        if flow["campaign_id"] == 8 and flow["position"] == position
+    )
+    assert any(path == f"streams/{flow['id']}" for _, path, _ in fake.calls)
+    assert any(path.endswith("/enable") for _, path, _ in fake.calls) == (detail == "matching")
+
+
+@pytest.mark.parametrize("stage", ["before_enable", "after_enable"])
+@pytest.mark.parametrize("field", ["domain_id", "alias", "state"])
+def test_creation_checks_campaign_drift_around_enable(client, fake, monkeypatch, stage, field):
+    from sqlalchemy import select
+
+    from adrobot.db import CampaignCreation
+
+    tracker = client.app.state.tracker
+    create_stream = tracker.create_stream
+    enable_campaign = tracker.enable_campaign
+    changed = {"domain_id": 99, "alias": "external-owner", "state": "deleted"}
+
+    def change_after_last_stream(payload):
+        result = create_stream(payload)
+        if stage == "before_enable" and payload["position"] == 2:
+            fake.campaigns[8][field] = changed[field]
+        return result
+
+    def change_after_enable(campaign_id):
+        enable_campaign(campaign_id)
+        if stage == "after_enable":
+            fake.campaigns[campaign_id][field] = changed[field]
+
+    monkeypatch.setattr(tracker, "create_stream", change_after_last_stream)
+    monkeypatch.setattr(tracker, "enable_campaign", change_after_enable)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == (502 if stage == "after_enable" and field == "state" else 409)
+    assert fake.campaigns[8][field] == changed[field]
+    enable_count = sum(path.endswith("/enable") for _, path, _ in fake.calls)
+    assert enable_count == (1 if stage == "after_enable" else 0)
+    with client.app.state.sessions() as db:
+        operation = db.scalar(select(CampaignCreation))
+        assert operation.phase == ("activating" if stage == "after_enable" else "building")
+    retry = client.post("/api/campaigns", json=CREATE_DATA)
+    assert retry.status_code == 409
+    assert sum(path.endswith("/enable") for _, path, _ in fake.calls) == enable_count
+
+
+def test_creation_rejects_explicitly_disabled_click_tracking(client, fake, monkeypatch):
+    get = fake._get
+
+    def disabled_tracking(request, path):
+        response = get(request, path)
+        if path == "campaigns/8/streams":
+            flows = response.json()
+            for flow in flows:
+                if flow["position"] == 2:
+                    flow["collect_clicks"] = False
+            return httpx.Response(200, json=flows)
+        return response
+
+    monkeypatch.setattr(fake, "_get", disabled_tracking)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == 409, response.text
+    assert fake.campaigns[8]["state"] == "disabled"
+    assert not any(path.endswith("/enable") for _, path, _ in fake.calls)
+
+
+def test_creation_rechecks_offer_before_enable_and_retries_without_duplicate_posts(
+    client, fake, monkeypatch
+):
+    tracker = client.app.state.tracker
+    create_stream = tracker.create_stream
+    offer = next(offer for offer in fake.offers if offer["id"] == CREATE_DATA["offer_id"])
+
+    def disable_offer_after_streams(payload):
+        result = create_stream(payload)
+        if payload["position"] == 2:
+            offer["state"] = "disabled"
+        return result
+
+    monkeypatch.setattr(tracker, "create_stream", disable_offer_after_streams)
+    response = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert response.status_code == 422, response.text
+    assert fake.campaigns[8]["state"] == "disabled"
+    assert not any(path.endswith("/enable") for _, path, _ in fake.calls)
+    offer["state"] = "active"
+    retry = client.post("/api/campaigns", json=CREATE_DATA)
+
+    assert retry.status_code == 201, retry.text
+    assert retry.json()["id"] == 8
+    assert fake.campaigns[8]["state"] == "active"
+    assert sum(method == "POST" and path == "campaigns" for method, path, _ in fake.calls) == 1
+    assert sum(method == "POST" and path == "streams" for method, path, _ in fake.calls) == 2
+    offer["state"] = "disabled"
+    assert client.post("/api/campaigns", json=CREATE_DATA).status_code == 201
